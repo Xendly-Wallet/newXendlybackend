@@ -17,7 +17,7 @@ impl NotificationService {
     pub fn new(database: Arc<SqliteDatabase>) -> Self {
         Self {
             database,
-            from_email: std::env::var("FROM_EMAIL").unwrap_or_else(|_| "noreply@stellarwallet.com".to_string()),
+            from_email: std::env::var("FROM_EMAIL").expect("FROM_EMAIL must be set in environment for production!"),
         }
     }
 
@@ -354,6 +354,65 @@ impl NotificationService {
             .build();
 
         mailer.send(&email).map_err(|e| format!("Send error: {}", e))?;
+        Ok(())
+    }
+
+    // Send security alert notification
+    pub async fn send_security_alert_notification(
+        &self,
+        user_id: &Uuid,
+        email: &str,
+        alert_type: &str,
+        ip_address: Option<&str>,
+        user_agent: Option<&str>,
+        location: Option<&str>,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        // Check user preferences
+        if let Some(prefs) = self.get_notification_preferences(user_id).await? {
+            if !prefs.security_alerts {
+                return Ok(()); // User opted out
+            }
+        }
+        let title = format!("⚠️ Security Alert: {}", alert_type);
+        let message = format!(
+            "A security-related event occurred: {}\nTime: {}\nIP: {}\nUser Agent: {}\nLocation: {}",
+            alert_type,
+            timestamp.to_rfc3339(),
+            ip_address.unwrap_or("unknown"),
+            user_agent.unwrap_or("unknown"),
+            location.unwrap_or("unknown")
+        );
+        let metadata = serde_json::json!({
+            "alert_type": alert_type,
+            "ip_address": ip_address,
+            "user_agent": user_agent,
+            "location": location,
+            "timestamp": timestamp,
+        });
+        let notification = Notification {
+            id: Uuid::new_v4(),
+            user_id: *user_id,
+            notification_type: NotificationType::SecurityAlert,
+            title: title.clone(),
+            message: message.clone(),
+            priority: NotificationPriority::Critical,
+            channels: vec![NotificationChannel::Email, NotificationChannel::InApp],
+            metadata: Some(metadata),
+            is_read: false,
+            created_at: timestamp,
+            sent_at: None,
+        };
+        self.database.store_notification(&notification).await?;
+        // Send email if enabled
+        if let Some(prefs) = self.get_notification_preferences(user_id).await? {
+            if prefs.email_enabled {
+                let _ = Self::send_email_smtp(&self.from_email, email, &title, &message).await;
+            }
+        }
+        println!("🔔 Notification: {}", title);
+        println!("📧 Message: {}", message);
+        self.database.mark_notification_sent(&notification.id).await?;
         Ok(())
     }
 

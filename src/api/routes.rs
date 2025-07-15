@@ -1,4 +1,4 @@
-use axum::{Router, routing::{post, get, delete, put}, Json, extract::{State, FromRequestParts}, http::{StatusCode, request::Parts, header::AUTHORIZATION}, response::IntoResponse};
+use axum::{Router, routing::{post, get, delete, put}, Json, extract::{FromRequestParts}, http::{StatusCode, request::Parts, header::AUTHORIZATION}, response::IntoResponse};
 use axum::extract::Path;
 use crate::api::types::*;
 use crate::database::sqlite::GLOBAL_DB;
@@ -10,8 +10,11 @@ use crate::services::auth::AuthService;
 use crate::services::jwt::JwtManager;
 use crate::services::stellar_service::StellarService;
 use serde::Serialize;
-use crate::utils::middleware::RateLimiter;
 use tracing::{info, error};
+use crate::utils::validation::Validator;
+use qrcode::QrCode;
+use qrcode::render::svg;
+use base64::{engine::general_purpose, Engine as _};
 
 // JWT extractor for Authorization: Bearer ...
 pub struct AuthBearer(pub String);
@@ -36,7 +39,7 @@ where
 
 // Helper to extract user from JWT
 async fn user_from_token(token: &str, _db: Arc<SqliteDatabase>) -> Result<crate::services::jwt::AuthenticatedUser, (StatusCode, String)> {
-    let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "your-super-secret-jwt-key-change-this-in-production".to_string());
+    let jwt_secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set in environment for production!");
     let jwt_manager = JwtManager::new(jwt_secret);
     let token_data = jwt_manager.validate_token(token).map_err(|e| (StatusCode::UNAUTHORIZED, format!("Invalid token: {}", e)))?;
     crate::services::jwt::AuthenticatedUser::try_from(token_data.claims).map_err(|e| (StatusCode::UNAUTHORIZED, format!("Invalid token: {}", e)))
@@ -50,6 +53,7 @@ pub struct SupportedAsset {
 }
 
 /// Main API router
+#[allow(dead_code)] // Not used, kept for possible future router composition
 pub fn api_router() -> Router {
     Router::new()
         .nest("/auth", auth_router())
@@ -62,8 +66,7 @@ pub fn api_router() -> Router {
 /// Auth API endpoints
 pub fn auth_router() -> Router {
     Router::new()
-        .route("/register", post(register))
-        .route("/login", post(login))
+        // .route("/register", post(register)) // Removed to avoid duplicate registration
         .route("/2fa-verify", post(two_fa_verify))
         .route("/change-password", post(change_password))
         .route("/disable-2fa", post(disable_2fa))
@@ -80,31 +83,58 @@ pub async fn register(
     Json(req): Json<RegisterRequest>,
 ) -> impl IntoResponse {
     let db = GLOBAL_DB.get().unwrap().clone(); // TODO: Replace with global singleton
-    let email = req.email.clone();
-    let username = req.username.clone();
+    let email = req.email.trim().to_string();
+    let username = req.username.trim().to_string();
+    // Validate email, username, password, phone
+    if let Err(_e) = Validator::validate_email(&email) {
+        return (StatusCode::BAD_REQUEST, Json(RegisterResponse {
+            user_id: Uuid::nil(),
+            message: "Invalid email address.".to_string(),
+        }));
+    }
+    if let Err(_e) = Validator::validate_username(&username) {
+        return (StatusCode::BAD_REQUEST, Json(RegisterResponse {
+            user_id: Uuid::nil(),
+            message: "Invalid username.".to_string(),
+        }));
+    }
+    if let Err(_e) = Validator::validate_password(&req.password) {
+        return (StatusCode::BAD_REQUEST, Json(RegisterResponse {
+            user_id: Uuid::nil(),
+            message: "Invalid password.".to_string(),
+        }));
+    }
+    if let Some(phone) = &req.phone_number {
+        if let Err(_e) = Validator::validate_phone(phone) {
+            return (StatusCode::BAD_REQUEST, Json(RegisterResponse {
+                user_id: Uuid::nil(),
+                message: "Invalid phone number.".to_string(),
+            }));
+        }
+    }
     // Check if user already exists
     if let Ok(Some(_)) = db.get_user_by_email(&email).await {
         info!(action = "register_email_conflict", user = %email);
         return (StatusCode::CONFLICT, Json(RegisterResponse {
             user_id: Uuid::nil(),
-            message: "Email already registered".to_string(),
+            message: "This email is already registered. Try logging in or use a different email.".to_string(),
         }));
     }
     if let Ok(Some(_)) = db.get_user_by_username(&username).await {
         info!(action = "register_username_conflict", user = %username);
         return (StatusCode::CONFLICT, Json(RegisterResponse {
             user_id: Uuid::nil(),
-            message: "Username already taken".to_string(),
+            message: "This username is already taken. Please choose another.".to_string(),
         }));
     }
     // Hash password
     let password_hash = match PasswordManager::hash_password(&req.password) {
         Ok(hash) => hash,
-        Err(_) => {
-            error!(action = "register_password_hash_failed", user = %email);
+        Err(e) => {
+            error!(action = "register_password_hash_failed", user = %email, error = %e);
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(RegisterResponse {
                 user_id: Uuid::nil(),
-                message: "Failed to hash password".to_string(),
+                message: "An internal error occurred. Please try again later.".to_string(),
             }));
         }
     };
@@ -113,7 +143,7 @@ pub async fn register(
     let user = crate::models::user::User {
         id: user_id,
         email: email.clone(),
-        username: username,
+        username,
         password_hash,
         is_verified: false,
         stellar_public_key: None,
@@ -132,7 +162,7 @@ pub async fn register(
         error!(action = "register_user_create_failed", user = %email, error = %e);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(RegisterResponse {
             user_id: Uuid::nil(),
-            message: format!("Failed to create user: {}", e),
+            message: "Could not create account. Please check your details and try again.".to_string(),
         }));
     }
     info!(action = "register_success", user = %email);
@@ -167,8 +197,8 @@ pub async fn login(
                 user_id: Some(user_id),
             }))
         }
-        Err(_e) => {
-            error!(action = "login_failed", user = %req.email_or_username);
+        Err(e) => {
+            error!(action = "login_failed", user = %req.email_or_username, error = %e);
             (StatusCode::UNAUTHORIZED, Json(LoginResponse {
                 token: "".to_string(),
                 expires_in: 0,
@@ -271,10 +301,12 @@ pub async fn two_fa_verify(
     match two_factor_service.verify_totp(&req.user_id, &req.totp_code).await {
         Ok(true) => {
             let auth_service = AuthService::new(db.clone());
-            // Issue JWT directly for the user (new helper method)
             match auth_service.generate_jwt(&user.id).await {
                 Ok(token) => (StatusCode::OK, Json(TwoFAVerifyResponse { token, expires_in: 86400 })),
-                Err(_) => (StatusCode::UNAUTHORIZED, Json(TwoFAVerifyResponse { token: "".to_string(), expires_in: 0 })),
+                Err(e) => {
+                    error!(action = "2fa_jwt_issue_failed", user_id = %user.id, error = %e);
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(TwoFAVerifyResponse { token: "".to_string(), expires_in: 0 }))
+                }
             }
         }
         _ => (StatusCode::UNAUTHORIZED, Json(TwoFAVerifyResponse { token: "".to_string(), expires_in: 0 })),
@@ -296,7 +328,7 @@ pub async fn change_password(
         Err(_) => return StatusCode::UNAUTHORIZED,
     };
     if user_record.totp_enabled {
-        let totp_code = req.totp_code.as_ref().map(|s| s.as_str()).unwrap_or("");
+        let totp_code = req.totp_code.as_deref().unwrap_or("");
         let two_factor_service = crate::services::two_factor_service::TwoFactorService::new(db.clone());
         match two_factor_service.verify_totp(&req.user_id, totp_code).await {
             Ok(true) => {},
@@ -306,7 +338,10 @@ pub async fn change_password(
     let user_service = crate::services::user_service::UserService { db: db.clone() };
     match user_service.change_user_password(&req.user_id, &req.current_password, &req.new_password).await {
         Ok(_) => StatusCode::OK,
-        Err(_) => StatusCode::BAD_REQUEST,
+        Err(e) => {
+            error!(action = "change_password_failed", user_id = %req.user_id, error = %e);
+            StatusCode::BAD_REQUEST
+        }
     }
 }
 
@@ -334,7 +369,10 @@ pub async fn disable_2fa(
     }
     match two_factor_service.disable_2fa(&req.user_id).await {
         Ok(_) => StatusCode::OK,
-        Err(_) => StatusCode::BAD_REQUEST,
+        Err(e) => {
+            error!(action = "disable_2fa_failed", user_id = %req.user_id, error = %e);
+            StatusCode::BAD_REQUEST
+        }
     }
 }
 
@@ -358,7 +396,7 @@ pub async fn delete_account(
     }
     // If 2FA is enabled, verify TOTP
     if user_record.totp_enabled {
-        let totp_code = req.totp_code.as_ref().map(|s| s.as_str()).unwrap_or("");
+        let totp_code = req.totp_code.as_deref().unwrap_or("");
         let two_factor_service = crate::services::two_factor_service::TwoFactorService::new(db.clone());
         match two_factor_service.verify_totp(&req.user_id, totp_code).await {
             Ok(true) => {},
@@ -386,37 +424,62 @@ pub async fn create_wallet(
                 Json(CreateWalletResponse {
                     wallet_id: Uuid::nil(),
                     public_key: "".to_string(),
-                    wallet_name: req.wallet_name,
-                    message: "Unauthorized or invalid JWT".to_string(),
+                    wallet_name: req.wallet_name.clone(),
+                    message: "You must be logged in to create a wallet.".to_string(),
                 }),
             );
         }
     };
+    // Validate wallet name and password
+    if let Err(_e) = Validator::validate_wallet_name(&req.wallet_name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(CreateWalletResponse {
+                wallet_id: Uuid::nil(),
+                public_key: "".to_string(),
+                wallet_name: req.wallet_name.clone(),
+                message: "Invalid wallet name.".to_string(),
+            }),
+        );
+    }
+    if let Err(_e) = Validator::validate_password(&req.password) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(CreateWalletResponse {
+                wallet_id: Uuid::nil(),
+                public_key: "".to_string(),
+                wallet_name: req.wallet_name.clone(),
+                message: "Invalid password.".to_string(),
+            }),
+        );
+    }
     // Create wallet
     let stellar_service = StellarService::new(db.clone());
     let wallet = match stellar_service.create_wallet(&_user.user_id, &req.wallet_name, &req.password) {
         Ok(w) => w,
         Err(e) => {
+            error!(action = "create_wallet_failed", user_id = %_user.user_id, error = %e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(CreateWalletResponse {
                     wallet_id: Uuid::nil(),
                     public_key: "".to_string(),
-                    wallet_name: req.wallet_name,
-                    message: format!("Failed to create wallet: {}", e),
+                    wallet_name: req.wallet_name.clone(),
+                    message: "Could not create wallet. Please check your details and try again.".to_string(),
                 }),
             );
         }
     };
     // Save to database
     if let Err(e) = db.create_stellar_wallet(&wallet).await {
+        error!(action = "save_wallet_failed", user_id = %_user.user_id, error = %e);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(CreateWalletResponse {
                 wallet_id: Uuid::nil(),
                 public_key: "".to_string(),
-                wallet_name: req.wallet_name,
-                message: format!("Failed to save wallet: {}", e),
+                wallet_name: req.wallet_name.clone(),
+                message: "Could not save wallet. Please try again later.".to_string(),
             }),
         );
     }
@@ -445,8 +508,8 @@ pub async fn import_wallet(
                 Json(ImportWalletResponse {
                     wallet_id: Uuid::nil(),
                     public_key: "".to_string(),
-                    wallet_name: req.wallet_name,
-                    message: "Unauthorized or invalid JWT".to_string(),
+                    wallet_name: req.wallet_name.clone(),
+                    message: "You must be logged in to import a wallet.".to_string(),
                 }),
             );
         }
@@ -455,25 +518,27 @@ pub async fn import_wallet(
     let wallet = match stellar_service.import_wallet(&_user.user_id, &req.wallet_name, &req.secret_key, &req.password) {
         Ok(w) => w,
         Err(e) => {
+            error!(action = "import_wallet_failed", user_id = %_user.user_id, error = %e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ImportWalletResponse {
                     wallet_id: Uuid::nil(),
                     public_key: "".to_string(),
-                    wallet_name: req.wallet_name,
-                    message: format!("Failed to import wallet: {}", e),
+                    wallet_name: req.wallet_name.clone(),
+                    message: "Could not import wallet. Please check your details and try again.".to_string(),
                 }),
             );
         }
     };
     if let Err(e) = db.create_stellar_wallet(&wallet).await {
+        error!(action = "save_imported_wallet_failed", user_id = %_user.user_id, error = %e);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ImportWalletResponse {
                 wallet_id: Uuid::nil(),
                 public_key: "".to_string(),
-                wallet_name: req.wallet_name,
-                message: format!("Failed to save wallet: {}", e),
+                wallet_name: req.wallet_name.clone(),
+                message: "Could not save imported wallet. Please try again later.".to_string(),
             }),
         );
     }
@@ -492,7 +557,7 @@ pub async fn import_wallet(
 pub async fn list_wallets(
     AuthBearer(token): AuthBearer,
 ) -> (StatusCode, Json<WalletListResponse>) {
-    let db = GLOBAL_DB.get().unwrap().clone(); // TODO: Replace with global singleton
+    let db = GLOBAL_DB.get().unwrap().clone();
     let _user = match user_from_token(&token, db.clone()).await {
         Ok(u) => u,
         Err((_status, _msg)) => {
@@ -502,15 +567,18 @@ pub async fn list_wallets(
             );
         }
     };
-    let wallets = match db.get_user_wallets(&_user.user_id).await {
-        Ok(ws) => ws,
-        Err(_) => vec![],
-    };
-    let summaries = wallets.iter().map(|w| WalletSummary {
-        wallet_id: w.id,
-        wallet_name: w.wallet_name.clone(),
-        public_key: w.public_key.clone(),
-    }).collect();
+    let wallets = db.get_user_wallets(&_user.user_id).await.unwrap_or_default();
+    let stellar_service = StellarService::new(db.clone());
+    let mut summaries = Vec::new();
+    for w in wallets.iter() {
+        let balances = stellar_service.get_wallet_balances(&w.public_key).await.unwrap_or_default();
+        summaries.push(WalletSummary {
+            wallet_id: w.id,
+            wallet_name: w.wallet_name.clone(),
+            public_key: w.public_key.clone(),
+            balances,
+        });
+    }
     (StatusCode::OK, Json(WalletListResponse { wallets: summaries }))
 }
 
@@ -519,7 +587,7 @@ pub async fn wallet_details(
     AuthBearer(token): AuthBearer,
     Path(wallet_id): Path<Uuid>,
 ) -> (StatusCode, Json<WalletDetailsResponse>) {
-    let db = GLOBAL_DB.get().unwrap().clone(); // TODO: Replace with global singleton
+    let db = GLOBAL_DB.get().unwrap().clone();
     let _user = match user_from_token(&token, db.clone()).await {
         Ok(u) => u,
         Err((_status, _msg)) => {
@@ -530,6 +598,7 @@ pub async fn wallet_details(
                     wallet_name: "".to_string(),
                     public_key: "".to_string(),
                     balance_xlm: None,
+                    balances: vec![],
                     created_at: chrono::Utc::now(),
                 }),
             );
@@ -545,6 +614,7 @@ pub async fn wallet_details(
                     wallet_name: "".to_string(),
                     public_key: "".to_string(),
                     balance_xlm: None,
+                    balances: vec![],
                     created_at: chrono::Utc::now(),
                 }),
             );
@@ -557,16 +627,20 @@ pub async fn wallet_details(
                     wallet_name: "".to_string(),
                     public_key: "".to_string(),
                     balance_xlm: None,
+                    balances: vec![],
                     created_at: chrono::Utc::now(),
                 }),
             );
         }
     };
+    let stellar_service = StellarService::new(db.clone());
+    let balances = stellar_service.get_wallet_balances(&wallet.public_key).await.unwrap_or_default();
     (StatusCode::OK, Json(WalletDetailsResponse {
         wallet_id: wallet.id,
         wallet_name: wallet.wallet_name,
         public_key: wallet.public_key,
         balance_xlm: wallet.balance_xlm.clone(),
+        balances,
         created_at: wallet.created_at,
     }))
 }
@@ -602,10 +676,7 @@ pub async fn wallet_balance(
         }
     };
     let stellar_service = StellarService::new(db.clone());
-    let balances = match stellar_service.get_wallet_balances(&wallet.public_key).await {
-        Ok(balances) => balances,
-        Err(_) => vec![],
-    };
+    let balances = stellar_service.get_wallet_balances(&wallet.public_key).await.unwrap_or_default();
     (StatusCode::OK, Json(WalletMultiAssetBalanceResponse { balances }))
 }
 
@@ -635,29 +706,52 @@ pub async fn send_payment(
         Err((_status, _msg)) => {
             return (
                 StatusCode::UNAUTHORIZED,
-                Json(SendPaymentResponse { transaction_hash: "".to_string(), message: "Unauthorized or invalid JWT".to_string() }),
+                Json(SendPaymentResponse { transaction_hash: "".to_string(), message: "You must be logged in to send payments.".to_string() }),
             );
         }
     };
+    // Validate amount
+    if req.amount <= 0.0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SendPaymentResponse { transaction_hash: "".to_string(), message: "Amount must be greater than 0.".to_string() }),
+        );
+    }
+    // Validate destination address
+    if !req.destination.trim().starts_with('G') {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SendPaymentResponse { transaction_hash: "".to_string(), message: "Invalid destination Stellar address format.".to_string() }),
+        );
+    }
+    // Validate memo
+    if let Some(memo) = &req.memo {
+        if let Err(_e) = Validator::validate_memo(memo) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(SendPaymentResponse { transaction_hash: "".to_string(), message: "Invalid memo.".to_string() }),
+            );
+        }
+    }
     // Check if 2FA is enabled for the user
     let user_record = match db.get_user_by_id(&_user.user_id).await {
         Ok(u) => u,
         Err(_) => {
             return (
                 StatusCode::UNAUTHORIZED,
-                Json(SendPaymentResponse { transaction_hash: "".to_string(), message: "User not found".to_string() }),
+                Json(SendPaymentResponse { transaction_hash: "".to_string(), message: "Account not found. Please log in again.".to_string() }),
             );
         }
     };
     if user_record.totp_enabled {
-        let totp_code = req.totp_code.as_ref().map(|s| s.as_str()).unwrap_or("");
+        let totp_code = req.totp_code.as_deref().unwrap_or("");
         let two_factor_service = crate::services::two_factor_service::TwoFactorService::new(db.clone());
         match two_factor_service.verify_totp(&_user.user_id, totp_code).await {
             Ok(true) => {},
             _ => {
                 return (
                     StatusCode::UNAUTHORIZED,
-                    Json(SendPaymentResponse { transaction_hash: "".to_string(), message: "Invalid or missing 2FA code".to_string() }),
+                    Json(SendPaymentResponse { transaction_hash: "".to_string(), message: "The 2FA code is incorrect or missing. Please try again.".to_string() }),
                 );
             }
         }
@@ -667,25 +761,25 @@ pub async fn send_payment(
         Ok(_) => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(SendPaymentResponse { transaction_hash: "".to_string(), message: "Wallet not found".to_string() }),
+                Json(SendPaymentResponse { transaction_hash: "".to_string(), message: "Wallet not found. Please check your wallet selection.".to_string() }),
             );
         }
         Err(_) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(SendPaymentResponse { transaction_hash: "".to_string(), message: "Failed to get wallet".to_string() }),
+                Json(SendPaymentResponse { transaction_hash: "".to_string(), message: "Failed to get wallet. Please try again later.".to_string() }),
             );
         }
     };
     // --- Asset issuer lookup logic ---
     let asset_code_upper = req.asset_code.as_deref().map(|c| c.to_uppercase());
-    let (asset_code, asset_issuer) = match asset_code_upper.as_deref() {
+    let (asset_code, _asset_issuer) = match asset_code_upper.as_deref() {
         Some("USDC") => (Some("USDC".to_string()), Some("GA5ZSE7V3Y3P5YF3VJZQ2Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5".to_string())),
         Some("XLM") | None => (Some("XLM".to_string()), None),
-        Some(other) => {
+        Some(_other) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(SendPaymentResponse { transaction_hash: "".to_string(), message: format!("Unsupported asset: {}", other) }),
+                Json(SendPaymentResponse { transaction_hash: "".to_string(), message: "You can only send XLM or USDC at this time.".to_string() }),
             );
         }
     };
@@ -700,9 +794,10 @@ pub async fn send_payment(
     ).await {
         Ok(h) => h,
         Err(e) => {
+            error!(action = "send_payment_failed", user_id = %_user.user_id, wallet_id = %wallet_id, error = %e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(SendPaymentResponse { transaction_hash: "".to_string(), message: format!("Failed to send payment: {}", e) }),
+                Json(SendPaymentResponse { transaction_hash: "".to_string(), message: "Failed to send payment. Please check your details and try again.".to_string() }),
             );
         }
     };
@@ -741,10 +836,7 @@ pub async fn wallet_transactions(
         }
     };
     let stellar_service = StellarService::new(db.clone());
-    let txs = match stellar_service.get_transaction_history(&wallet.public_key).await {
-        Ok(list) => list,
-        Err(_) => vec![],
-    };
+    let txs = stellar_service.get_transaction_history(&wallet.public_key).await.unwrap_or_default();
     let summaries = txs.into_iter().map(|t| TransactionSummary {
         hash: t.hash,
         amount: t.amount,
@@ -754,6 +846,7 @@ pub async fn wallet_transactions(
         to: t.to,
         memo: t.memo,
         created_at: t.created_at,
+        status: t.status, // Add status from transaction
     }).collect();
     (StatusCode::OK, Json(TransactionHistoryResponse { transactions: summaries }))
 }
@@ -787,6 +880,7 @@ pub async fn sync_wallet(
                     wallet_name: "".to_string(),
                     public_key: "".to_string(),
                     balance_xlm: None,
+                    balances: vec![],
                     created_at: chrono::Utc::now(),
                 }),
             );
@@ -802,6 +896,7 @@ pub async fn sync_wallet(
                     wallet_name: "".to_string(),
                     public_key: "".to_string(),
                     balance_xlm: None,
+                    balances: vec![],
                     created_at: chrono::Utc::now(),
                 }),
             );
@@ -818,6 +913,7 @@ pub async fn sync_wallet(
                     wallet_name: wallet.wallet_name,
                     public_key: wallet.public_key,
                     balance_xlm: None,
+                    balances: vec![],
                     created_at: wallet.created_at,
                 }),
             );
@@ -832,6 +928,7 @@ pub async fn sync_wallet(
             wallet_name: wallet.wallet_name,
             public_key: wallet.public_key,
             balance_xlm: Some(info.balance_xlm),
+            balances: vec![],
             created_at: wallet.created_at,
         })
     )
@@ -932,14 +1029,14 @@ pub async fn receive_wallet(
                     public_key: "".to_string(),
                     qr_code_url: None,
                     supported_assets: vec![],
-                    message: "Unauthorized or invalid JWT".to_string(),
+                    message: "You must be logged in to view receive information.".to_string(),
                 }),
             );
         }
     };
     let wallet = match db.get_wallet_by_id(&wallet_id).await {
         Ok(w) if w.user_id == _user.user_id => w,
-        _ => {
+        Ok(_) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(ReceiveWalletResponse {
@@ -947,17 +1044,38 @@ pub async fn receive_wallet(
                     public_key: "".to_string(),
                     qr_code_url: None,
                     supported_assets: vec![],
-                    message: "Wallet not found".to_string(),
+                    message: "Wallet not found. Please check your wallet selection.".to_string(),
+                }),
+            );
+        }
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ReceiveWalletResponse {
+                    wallet_id,
+                    public_key: "".to_string(),
+                    qr_code_url: None,
+                    supported_assets: vec![],
+                    message: "Failed to get wallet. Please try again later.".to_string(),
                 }),
             );
         }
     };
-    let qr_code_url = Some(format!("https://api.qrserver.com/v1/create-qr-code/?data={}&size=200x200", wallet.public_key));
-    let stellar_service = StellarService::new(db.clone());
-    let supported_assets = match stellar_service.get_wallet_balances(&wallet.public_key).await {
-        Ok(balances) => balances,
-        Err(_) => vec![],
+    // Generate QR code SVG and encode as data URI
+    let qr_code_url = match QrCode::new(&wallet.public_key) {
+        Ok(qr_code) => {
+            let svg = qr_code.render::<svg::Color>()
+                .min_dimensions(200, 200)
+                .dark_color(svg::Color("#000000"))
+                .light_color(svg::Color("#ffffff"))
+                .build();
+            let svg_base64 = general_purpose::STANDARD.encode(svg.as_bytes());
+            Some(format!("data:image/svg+xml;base64,{}", svg_base64))
+        },
+        Err(_) => None,
     };
+    let stellar_service = StellarService::new(db.clone());
+    let supported_assets = stellar_service.get_wallet_balances(&wallet.public_key).await.unwrap_or_default();
     (
         StatusCode::OK,
         Json(ReceiveWalletResponse {
@@ -965,7 +1083,7 @@ pub async fn receive_wallet(
             public_key: wallet.public_key,
             qr_code_url,
             supported_assets,
-            message: "Share this address to receive payments in any supported asset (XLM, USDC, etc.)".to_string(),
+            message: "Share this address to receive XLM or USDC payments.".to_string(),
         })
     )
 }
@@ -995,7 +1113,10 @@ pub async fn view_notifications(
     };
     let notifications = match db.get_user_notifications(&_user.user_id, Some(50)).await {
         Ok(list) => list,
-        Err(_) => vec![],
+        Err(e) => {
+            error!(action = "fetch_notifications_failed", user_id = %_user.user_id, error = %e);
+            vec![]
+        }
     };
     let items = notifications.into_iter().map(|n| NotificationItem {
         id: n.id,
@@ -1206,12 +1327,49 @@ pub async fn update_profile(
         }
     };
     if let Some(email) = req.email {
+        if let Err(_e) = Validator::validate_email(&email) {
+            return (StatusCode::BAD_REQUEST, Json(ProfileResponse {
+                user_id: uuid::Uuid::nil(),
+                email: "".to_string(),
+                username: "".to_string(),
+                is_verified: false,
+                phone_number: None,
+                is_phone_verified: false,
+                created_at: chrono::Utc::now(),
+            }));
+        }
         user_record.email = email;
     }
     if let Some(username) = req.username {
+        if let Err(_e) = Validator::validate_username(&username) {
+            return (StatusCode::BAD_REQUEST, Json(ProfileResponse {
+                user_id: uuid::Uuid::nil(),
+                email: "".to_string(),
+                username: "".to_string(),
+                is_verified: false,
+                phone_number: None,
+                is_phone_verified: false,
+                created_at: chrono::Utc::now(),
+            }));
+        }
         user_record.username = username;
     }
-    if let Err(_) = db.update_user_profile(&user_record).await {
+    if let Some(ref phone) = req.phone_number {
+        if let Err(_e) = Validator::validate_phone(phone) {
+            return (StatusCode::BAD_REQUEST, Json(ProfileResponse {
+                user_id: uuid::Uuid::nil(),
+                email: "".to_string(),
+                username: "".to_string(),
+                is_verified: false,
+                phone_number: None,
+                is_phone_verified: false,
+                created_at: chrono::Utc::now(),
+            }));
+        }
+    }
+    user_record.phone_number = req.phone_number.clone();
+    if let Err(e) = db.update_user_profile(&user_record).await {
+        error!(action = "update_profile_failed", user_id = %user.user_id, error = %e);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(ProfileResponse {
             user_id: uuid::Uuid::nil(),
             email: "".to_string(),
@@ -1267,8 +1425,20 @@ pub async fn update_phone(
             }));
         }
     };
-    user_record.phone_number = Some(req.phone_number);
-    if let Err(_) = db.update_user_profile(&user_record).await {
+    if let Err(_e) = Validator::validate_phone(&req.phone_number) {
+        return (StatusCode::BAD_REQUEST, Json(ProfileResponse {
+            user_id: uuid::Uuid::nil(),
+            email: "".to_string(),
+            username: "".to_string(),
+            is_verified: false,
+            phone_number: None,
+            is_phone_verified: false,
+            created_at: chrono::Utc::now(),
+        }));
+    }
+    user_record.phone_number = Some(req.phone_number.clone());
+    if let Err(e) = db.update_user_profile(&user_record).await {
+        error!(action = "update_phone_failed", user_id = %user.user_id, error = %e);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(ProfileResponse {
             user_id: uuid::Uuid::nil(),
             email: "".to_string(),
@@ -1404,7 +1574,7 @@ pub async fn enable_2fa(
         Err((_status, _msg)) => {
             return (StatusCode::UNAUTHORIZED, Json(Enable2FAResponse {
                 success: false,
-                message: "Unauthorized".to_string(),
+                message: "You must be logged in to enable 2FA.".to_string(),
                 backup_codes: vec![],
             }));
         }
@@ -1420,9 +1590,10 @@ pub async fn enable_2fa(
             }))
         }
         Err(e) => {
+            error!(action = "enable_2fa_failed", user_id = %user.user_id, error = %e);
             (StatusCode::UNAUTHORIZED, Json(Enable2FAResponse {
                 success: false,
-                message: format!("Failed to enable 2FA: {}", e),
+                message: "Failed to enable 2FA. Please check your code and try again.".to_string(),
                 backup_codes: vec![],
             }))
         }
@@ -1448,7 +1619,6 @@ pub fn wallet_router() -> Router {
         .route("/", get(list_wallets))
         .route("/:id", get(wallet_details))
         .route("/:id/balance", get(wallet_balance))
-        .route("/:id/send", post(send_payment))
         .route("/:id/transactions", get(wallet_transactions))
         .route("/:id/sync", post(sync_wallet))
         .route("/:id/fund", post(fund_wallet))

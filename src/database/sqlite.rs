@@ -10,6 +10,7 @@ use base32;
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
 
+#[allow(dead_code)] // For future global DB singleton usage
 pub static GLOBAL_DB: OnceCell<Arc<SqliteDatabase>> = OnceCell::new();
 
 #[derive(Debug)]
@@ -26,12 +27,11 @@ impl SqliteDatabase {
         }
 
         //Create the database file if it doesn't exist
-        // if !Path::new(database_path).exists() {
-        //     std::fs::File::create(database_path)
-        //         .map_err(|e| AppError::DatabaseError(format!("Failed to create database file: {}", e)))?;
-        //     println!("📁 Created new database file: {}", database_path);
-        // }
-
+        if !Path::new(database_path).exists() {
+            std::fs::File::create(database_path)
+                .map_err(|e| AppError::DatabaseError(format!("Failed to create database file: {}", e)))?;
+            println!("📁 Created new database file: {}", database_path);
+        }
         let database_url = format!("sqlite:{}", database_path);
                
         let pool = SqlitePool::connect(&database_url)
@@ -324,7 +324,7 @@ impl SqliteDatabase {
             .bind(&user.phone_number)
             .bind(user.is_phone_verified)
             .bind(&user.phone_verification_code)
-            .bind(&user.phone_verified_at)
+            .bind(user.phone_verified_at)
             .bind(&user.totp_secret)
             .bind(user.totp_enabled)
             .bind(&user.backup_codes)
@@ -978,7 +978,7 @@ impl SqliteDatabase {
             .bind(&notification.message)
             .bind(format!("{:?}", notification.priority))
             .bind(serde_json::to_string(&notification.channels)?)
-            .bind(notification.metadata.as_ref().map(|m| serde_json::to_string(m)).transpose()?)
+            .bind(notification.metadata.as_ref().map(serde_json::to_string).transpose()?)
             .bind(notification.is_read)
             .bind(notification.created_at.to_rfc3339())
             .bind(notification.sent_at.map(|dt| dt.to_rfc3339()))

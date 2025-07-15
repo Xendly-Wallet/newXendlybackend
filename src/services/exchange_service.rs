@@ -90,8 +90,8 @@ impl ExchangeService {
 
     /// Preview a currency exchange using Stellar DEX pathfinding
     pub async fn calculate_exchange_preview(&self, request: &ExchangeRequest) -> Result<ExchangePreview> {
-        let (rate, path) = self.get_exchange_rate(&request.from_currency, &request.to_currency, request.amount).await?;
-        let to_amount = request.amount * rate;
+        let (_rate, _path) = self.get_exchange_rate(&request.from_currency, &request.to_currency, request.amount).await?;
+        let to_amount = request.amount * _rate;
         let estimated_fee = request.amount * 0.001; // 0.1% fee (can be adjusted)
         let total_cost = request.amount + estimated_fee;
         Ok(ExchangePreview {
@@ -99,7 +99,7 @@ impl ExchangeService {
             to_currency: request.to_currency.clone(),
             from_amount: request.amount,
             to_amount,
-            exchange_rate: rate,
+            exchange_rate: _rate,
             estimated_fee,
             total_cost,
         })
@@ -108,10 +108,9 @@ impl ExchangeService {
     /// Execute a currency exchange using Stellar DEX path payment
     pub async fn execute_exchange(&self, request: &ExchangeRequest) -> Result<ExchangeTransaction> {
         // Preview to get rate and path
-        let (rate, path) = self.get_exchange_rate(&request.from_currency, &request.to_currency, request.amount).await?;
-        let to_amount = request.amount * rate;
+        let (_rate, _path) = self.get_exchange_rate(&request.from_currency, &request.to_currency, request.amount).await?;
+        let to_amount = request.amount * _rate;
         let estimated_fee = request.amount * 0.001;
-        let total_cost = request.amount + estimated_fee;
         // Get wallets
         let source_wallet = self.database.get_wallet_by_id(&request.source_wallet_id).await?;
         let destination_wallet = self.database.get_wallet_by_id(&request.destination_wallet_id).await?;
@@ -122,7 +121,7 @@ impl ExchangeService {
             &request.from_currency,
             &request.to_currency,
             request.amount,
-            &path
+            &_path
         ).await?;
         // Record transaction
         let transaction = ExchangeTransaction {
@@ -132,7 +131,7 @@ impl ExchangeService {
             to_currency: request.to_currency.clone(),
             from_amount: request.amount,
             to_amount,
-            exchange_rate: rate,
+            exchange_rate: _rate,
             fee_amount: estimated_fee,
             stellar_tx_hash: Some(payment_result.tx_hash),
             status: ExchangeStatus::Completed,

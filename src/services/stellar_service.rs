@@ -27,12 +27,16 @@ pub struct TransactionInfo {
     pub hash: String,
     pub transaction_type: String,
     pub amount: String,
+    #[allow(dead_code)] // For future asset support in transaction explorer
     pub asset_code: String,
+    #[allow(dead_code)] // For future asset support in transaction explorer
     pub asset_issuer: Option<String>,
     pub from: String,
     pub to: String,
     pub memo: Option<String>,
     pub created_at: DateTime<Utc>,
+    #[allow(dead_code)] // For future transaction status tracking
+    pub status: String, // New: transaction status (pending, completed, failed, etc.)
 }
 
 #[allow(dead_code)]
@@ -255,14 +259,14 @@ impl StellarService {
             .map_err(|e| AppError::StellarError(format!("Failed to connect to Friendbot: {}", e)))?;
 
         // Get the response body for better error messages
-        let status = response.status();
+        let _status = response.status();
         let body = response.text().await
             .unwrap_or_else(|_| "No response body".to_string());
 
-        if !status.is_success() {
+        if !_status.is_success() {
             return Err(AppError::StellarError(format!(
                 "Friendbot funding failed (Status: {}): {}",
-                status,
+                _status,
                 body
             )));
         }
@@ -294,12 +298,7 @@ impl StellarService {
         if !secret_key.starts_with('S') {
             return false;
         }
-
-        // Try to parse as a Stellar private key
-        match Strkey::from_string(secret_key) {
-            Ok(Strkey::PrivateKeyEd25519(_)) => true,
-            _ => false
-        }
+        matches!(Strkey::from_string(secret_key), Ok(Strkey::PrivateKeyEd25519(_)))
     }
 
     fn encrypt_secret_key(&self, secret_key: &str, password: &str) -> Result<String> {
@@ -583,9 +582,7 @@ impl StellarService {
         };
 
         // Ensure we have exactly 32 bytes for the signing key
-        let seed_array: [u8; 32] = seed_bytes
-            .try_into()
-            .map_err(|_| AppError::StellarError("Invalid seed length".to_string()))?;
+        let seed_array: [u8; 32] = seed_bytes;
         
         println!("✍️ Signing transaction...");
         // 6. Sign the hash using ed25519-dalek 2.1
@@ -632,8 +629,8 @@ impl StellarService {
             .map_err(|e| AppError::StellarError(format!("Failed to submit transaction: {}", e)))?;
     
         // Get status before consuming response
-        let status = response.status();
-        println!("📝 Response status: {}", status);
+        let _status = response.status();
+        println!("📝 Response status: {}", _status);
     
         // Parse the response
         let resp_json: serde_json::Value = response.json().await
@@ -698,6 +695,8 @@ impl StellarService {
     }
 
     /// Sends a payment of any asset (XLM, USDC, etc.) from the source wallet to the destination.
+    #[allow(dead_code)] // For future multi-asset support in the API
+    /// This method is kept for future support of sending non-XLM assets via the API.
     pub async fn send_payment_asset(
         &self,
         source_public_key: &str,
@@ -735,9 +734,7 @@ impl StellarService {
                 };
                 Asset::CreditAlphanum4(
                     stellar_xdr::curr::AlphaNum4 {
-                        asset_code: stellar_xdr::curr::AssetCode4(
-                            b"USDC".clone()
-                        ),
+                        asset_code: stellar_xdr::curr::AssetCode4(*b"USDC"),
                         issuer: stellar_xdr::curr::AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(pk))),
                     }
                 )
@@ -818,9 +815,7 @@ impl StellarService {
             Ok(Strkey::PrivateKeyEd25519(sk)) => sk.0,
             _ => return Err(AppError::ValidationError("Invalid secret key format".to_string())),
         };
-        let seed_array: [u8; 32] = seed_bytes
-            .try_into()
-            .map_err(|_| AppError::StellarError("Invalid seed length".to_string()))?;
+        let seed_array: [u8; 32] = seed_bytes;
         let signing_key = SigningKey::from_bytes(&seed_array);
         let signature = signing_key.sign(&tx_hash);
         let verifying_key = signing_key.verifying_key();
@@ -910,6 +905,7 @@ impl StellarService {
                 to: tx.to_address,
                 memo: tx.memo,
                 created_at: tx.created_at,
+                status: "success".to_string(), // Add status from WalletTransaction
             });
         }
 
@@ -939,6 +935,7 @@ impl StellarService {
                         to: op["to"].as_str().unwrap_or("").to_string(),
                         memo: None,
                         created_at,
+                        status: "success".to_string(), // Assume success for Horizon transactions
                     };
                     transaction_history.push(transaction_info.clone()); // Clone transaction_info here
 
@@ -1246,10 +1243,10 @@ impl StellarService {
         let to_currency = supported_currencies.iter().find(|c| c.code == to).ok_or_else(|| crate::errors::AppError::ValidationError(format!("Unknown destination currency: {}", to)))?;
         let from_asset_type = if from_currency.is_native { "native" } else { "credit_alphanum4" };
         let from_asset_code = if from_currency.is_native { "" } else { &from_currency.code };
-        let from_asset_issuer = if from_currency.is_native { "" } else { from_currency.asset_issuer.as_ref().map(|s| s.as_str()).unwrap_or("") };
-        let to_asset_type = if to_currency.is_native { "native" } else { "credit_alphanum4" };
+        let from_asset_issuer = if from_currency.is_native { "" } else { from_currency.asset_issuer.as_deref().map_or("", |s| s) };
+        let _to_asset_type = if to_currency.is_native { "native" } else { "credit_alphanum4" };
         let to_asset_code = if to_currency.is_native { "" } else { &to_currency.code };
-        let to_asset_issuer = if to_currency.is_native { "" } else { to_currency.asset_issuer.as_ref().map(|s| s.as_str()).unwrap_or("") };
+        let to_asset_issuer = if to_currency.is_native { "" } else { to_currency.asset_issuer.as_deref().map_or("", |s| s) };
         // Build destination_assets param
         let destination_assets = if to_currency.is_native {
             "native".to_string()
@@ -1284,12 +1281,12 @@ impl StellarService {
     /// Execute a path payment on Stellar DEX
     pub async fn send_path_payment(
         &self,
-        source_wallet: &crate::models::stellar_wallet::StellarWallet,
-        dest_wallet: &crate::models::stellar_wallet::StellarWallet,
-        from: &str,
-        to: &str,
-        amount: f64,
-        path: &Vec<String>,
+        _source_wallet: &crate::models::stellar_wallet::StellarWallet,
+        _dest_wallet: &crate::models::stellar_wallet::StellarWallet,
+        _from: &str,
+        _to: &str,
+        _amount: f64,
+        _path: &[String],
     ) -> Result<PathPaymentResult> {
         // This is a placeholder for actual path payment logic using stellar-sdk or xdr
         // In production, you would build and sign a PathPaymentStrictSend operation

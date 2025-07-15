@@ -112,6 +112,7 @@ pub struct WalletSummary {
     pub wallet_id: uuid::Uuid,
     pub wallet_name: String,
     pub public_key: String,
+    pub balances: Vec<AssetBalance>, // New: all asset balances (XLM, USDC, etc.)
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -120,6 +121,7 @@ pub struct WalletDetailsResponse {
     pub wallet_name: String,
     pub public_key: String,
     pub balance_xlm: Option<String>,
+    pub balances: Vec<AssetBalance>, // New: all asset balances (XLM, USDC, etc.)
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -170,6 +172,7 @@ pub struct TransactionSummary {
     pub to: String,
     pub memo: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub status: String, // New: transaction status (pending, completed, failed, etc.)
 } 
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -241,6 +244,7 @@ pub struct ProfileResponse {
 pub struct UpdateProfileRequest {
     pub email: Option<String>,
     pub username: Option<String>,
+    pub phone_number: Option<String>, // Allow updating phone number
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

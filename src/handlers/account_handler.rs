@@ -183,6 +183,20 @@ impl AccountHandler {
         }
 
         // Attempt login
+        // Try to get user by email/username for user_id/email, else use identifier as email
+        let db = self.user_service.db.clone();
+        let identifier_clone = identifier.clone();
+        let user_opt = {
+            let db = db.clone();
+            async move {
+                let by_email = db.get_user_by_email(&identifier_clone).await.ok().flatten();
+                if by_email.is_some() {
+                    by_email
+                } else {
+                    db.get_user_by_username(&identifier_clone).await.ok().flatten()
+                }
+            }
+        }.await;
         match self.user_service.authenticate_user(&identifier, &password).await {
             Ok(user) => {
                 println!();
@@ -193,11 +207,23 @@ impl AccountHandler {
                 println!("📧 Email: {}", user.email);
                 println!("📅 Last login: {}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"));
                 println!();
-                
                 CLI::print_info("Login feature completed! Dashboard coming soon...");
             }
             Err(e) => {
                 CLI::print_error(&format!("Login failed: {}", e));
+                // Send security alert notification for failed login
+                if let Some(user) = user_opt {
+                    let notification_service = crate::services::notification_service::NotificationService::new(db.clone());
+                    let _ = notification_service.send_security_alert_notification(
+                        &user.id,
+                        &user.email,
+                        "failed_login",
+                        None,
+                        None,
+                        None,
+                        chrono::Utc::now()
+                    ).await;
+                }
                 return Err(e);
             }
         }

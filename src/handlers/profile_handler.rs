@@ -114,7 +114,21 @@ impl ProfileHandler {
         }
         // Call API/service with TOTP code
         match self.user_service.change_user_password_with_2fa(user_id, &current_password, &new_password, totp_code).await {
-            Ok(_) => println!("{}", "✅ Password changed successfully!".green()),
+            Ok(_) => {
+                println!("{}", "✅ Password changed successfully!".green());
+                // Send security alert notification
+                let user = self.user_service.get_user_by_id(user_id).await?;
+                let notification_service = crate::services::notification_service::NotificationService::new(self.user_service.db.clone());
+                let _ = notification_service.send_security_alert_notification(
+                    &user.id,
+                    &user.email,
+                    "password_change",
+                    None,
+                    None,
+                    None,
+                    chrono::Utc::now()
+                ).await;
+            },
             Err(e) => CLI::print_error(&format!("Failed to change password: {}", e)),
         }
         Ok(())
@@ -182,7 +196,21 @@ impl ProfileHandler {
                     match self.two_factor_service.verify_totp(user_id, &code).await {
                         Ok(true) => {
                             match self.two_factor_service.disable_2fa(user_id).await {
-                                Ok(_) => println!("{}", "✅ 2FA disabled successfully!".green()),
+                                Ok(_) => {
+                                    println!("{}", "✅ 2FA disabled successfully!".green());
+                                    // Send security alert notification
+                                    let user = self.user_service.get_user_by_id(user_id).await?;
+                                    let notification_service = crate::services::notification_service::NotificationService::new(self.user_service.db.clone());
+                                    let _ = notification_service.send_security_alert_notification(
+                                        &user.id,
+                                        &user.email,
+                                        "2fa_disabled",
+                                        None,
+                                        None,
+                                        None,
+                                        chrono::Utc::now()
+                                    ).await;
+                                },
                                 Err(e) => CLI::print_error(&format!("Failed to disable 2FA: {}", e)),
                             }
                         }
@@ -207,6 +235,17 @@ impl ProfileHandler {
                     println!("- {}", code);
                 }
                 println!("2FA setup complete! Please enable 2FA in your app.");
+                // Send security alert notification
+                let notification_service = crate::services::notification_service::NotificationService::new(self.user_service.db.clone());
+                let _ = notification_service.send_security_alert_notification(
+                    &user.id,
+                    &user.email,
+                    "2fa_enabled",
+                    None,
+                    None,
+                    None,
+                    chrono::Utc::now()
+                ).await;
             }
             Err(e) => CLI::print_error(&format!("Failed to setup 2FA: {}", e)),
         }
@@ -246,7 +285,21 @@ impl ProfileHandler {
         }
         // Call API/service with TOTP code
         match self.user_service.delete_account_with_2fa(user_id, &password, totp_code).await {
-            Ok(_) => println!("{}", "✅ Account deleted successfully!".green()),
+            Ok(_) => {
+                println!("{}", "✅ Account deleted successfully!".green());
+                // Send security alert notification
+                let user = self.user_service.get_user_by_id(user_id).await?;
+                let notification_service = crate::services::notification_service::NotificationService::new(self.user_service.db.clone());
+                let _ = notification_service.send_security_alert_notification(
+                    &user.id,
+                    &user.email,
+                    "account_deleted",
+                    None,
+                    None,
+                    None,
+                    chrono::Utc::now()
+                ).await;
+            },
             Err(e) => CLI::print_error(&format!("Failed to delete account: {}", e)),
         }
         Ok(())

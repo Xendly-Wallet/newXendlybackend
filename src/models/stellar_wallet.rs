@@ -46,7 +46,7 @@ pub struct WalletBalance {
     pub selling_liabilities: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AssetBalance {
     pub id: Uuid,
     pub wallet_id: Uuid,

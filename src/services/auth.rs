@@ -22,7 +22,7 @@ impl AuthService {
     pub fn new(database: Arc<SqliteDatabase>) -> Self {
         // In production, this should come from environment variables
         let jwt_secret = std::env::var("JWT_SECRET")
-            .unwrap_or_else(|_| "your-super-secret-jwt-key-change-this-in-production".to_string());
+            .expect("JWT_SECRET must be set in environment for production!");
         
         Self {
             jwt_manager: JwtManager::new(jwt_secret),

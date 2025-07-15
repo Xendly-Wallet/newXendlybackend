@@ -6,7 +6,7 @@ use std::env;
 pub async fn send_sms_infobip(to: &str, message: &str) -> Result<(), Box<dyn std::error::Error>> {
     let api_key = env::var("INFOBIP_API_KEY")?;
     let base_url = env::var("INFOBIP_BASE_URL")?;
-    let sender = env::var("INFOBIP_SENDER").unwrap_or_else(|_| "InfoSMS".to_string());
+    let sender = env::var("INFOBIP_SENDER").expect("INFOBIP_SENDER must be set in environment for production!");
 
     let url = format!("https://{}/sms/2/text/advanced", base_url);
 

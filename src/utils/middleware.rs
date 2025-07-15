@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Request, ConnectInfo},
+    extract::Request,
     http::StatusCode,
     middleware::Next,
     response::Response,
@@ -15,12 +15,14 @@ use crate::database::sqlite::SqliteDatabase;
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RateLimitEntry {
     pub count: u64,
     pub window_start: Instant,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct RateLimiter {
     pub requests_per_second: u64,
@@ -75,9 +77,6 @@ impl RateLimiter {
 
 static RATE_LIMITER: Lazy<DashMap<String, (u32, Instant)>> = Lazy::new(DashMap::new);
 
-const MAX_REQUESTS: u32 = 5;
-const WINDOW: Duration = Duration::from_secs(1);
-
 pub async fn global_rate_limiter(request: Request, next: Next) -> Result<Response, StatusCode> {
     // Extract IP from request extensions
     let ip = request
@@ -90,19 +89,20 @@ pub async fn global_rate_limiter(request: Request, next: Next) -> Result<Respons
     let mut entry = RATE_LIMITER.entry(ip).or_insert((0, now));
 
     // Reset window if expired
-    if now.duration_since(entry.1) > WINDOW {
+    if now.duration_since(entry.1) > Duration::from_secs(1) {
         *entry = (1, now);
     } else {
         entry.0 += 1;
     }
 
-    if entry.0 > MAX_REQUESTS {
+    if entry.0 > 5 {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
     Ok(next.run(request).await)
 }
 
+#[allow(dead_code)]
 pub async fn rate_limiter_middleware(
     Extension((limiter, _db)): Extension<(Arc<RateLimiter>, Arc<SqliteDatabase>)>,
     request: Request,

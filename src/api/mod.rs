@@ -1,19 +1,19 @@
-use axum::{Router, routing::get, response::IntoResponse, Json};
+use axum::{Router, response::IntoResponse, Json};
 use std::net::SocketAddr;
 use utoipa::OpenApi;
 use utoipa::Modify;
 use utoipa_swagger_ui::SwaggerUi;
 use utoipa_redoc::{Redoc, Servable};
-use tokio::net::TcpListener;
 use std::sync::Arc;
 use crate::database::sqlite::SqliteDatabase;
 use serde_json::Value;
-use crate::utils::middleware::{RateLimiter, rate_limiter_middleware, global_rate_limiter};
+use crate::utils::middleware::{RateLimiter, global_rate_limiter};
 use axum::Extension;
 use crate::database::sqlite::GLOBAL_DB;
-use tracing::{info, error};
 use uuid::Uuid;
-use axum::{http::Request, middleware::Next, response::Response};
+use axum::{http::HeaderValue};
+use tower_http::cors::{CorsLayer, Any};
+use hyper::Method;
 
 mod routes;
 mod types;
@@ -140,11 +140,6 @@ fn get_rate_limit_per_sec() -> u64 {
         .unwrap_or(5)
 }
 
-// Helper to extract IP address for per-IP rate limiting
-fn ip_key_extractor<B>(req: &axum::http::Request<B>) -> Option<String> {
-    req.extensions().get::<axum::extract::ConnectInfo<SocketAddr>>().map(|info| info.0.ip().to_string())
-}
-
 pub async fn request_id_middleware(
     mut req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
@@ -156,6 +151,8 @@ pub async fn request_id_middleware(
     next.run(req).await
 }
 
+/// Main entry point for the Xendly API server.
+/// Sets up all routes, middleware, and documentation endpoints.
 pub async fn start_http_server() {
     let openapi = ApiDoc::openapi();
     let db = Arc::new(SqliteDatabase::new("stellar_wallet.db").await.unwrap());
@@ -163,7 +160,13 @@ pub async fn start_http_server() {
     let limiter = Arc::new(RateLimiter::new(get_rate_limit_per_sec(), 1)); // 5 req/sec/IP by default
     let shared_state = (limiter.clone(), db.clone());
 
+    let cors = CorsLayer::new()
+        .allow_origin("http://localhost:3000".parse::<HeaderValue>().unwrap())
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_headers(Any);
+
     let app = Router::new()
+        .layer(cors)
         .layer(axum::middleware::from_fn(request_id_middleware))
         // Sensitive endpoints with per-IP rate limiting
         .route(
@@ -225,7 +228,7 @@ async fn openapi_json() -> Json<Value> {
     Json(serde_json::to_value(openapi).unwrap())
 }
 
-/// Serve Redoc UI for API documentation
+/// Serves the Redoc UI for API documentation.
 async fn redoc_ui() -> impl IntoResponse {
     let html = r#"
     <!DOCTYPE html>
@@ -251,7 +254,7 @@ async fn redoc_ui() -> impl IntoResponse {
     axum::response::Html(html)
 }
 
-/// Generate and serve API documentation as Markdown
+/// Serves the API documentation as downloadable Markdown.
 async fn api_markdown() -> impl IntoResponse {
     let markdown = docs::generate_markdown_docs();
     axum::response::Response::builder()
@@ -261,7 +264,7 @@ async fn api_markdown() -> impl IntoResponse {
         .unwrap()
 }
 
-/// Serve comprehensive API documentation page
+/// Serves the main API documentation HTML page.
 async fn api_documentation() -> impl IntoResponse {
     let html = docs::generate_documentation_html();
     axum::response::Html(html)

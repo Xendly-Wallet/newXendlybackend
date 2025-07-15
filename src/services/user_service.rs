@@ -105,7 +105,7 @@ impl UserService {
         // Check if 2FA is enabled
         let user = self.db.get_user_by_id(user_id).await?;
         if user.totp_enabled {
-            let code = totp_code.as_ref().map(|s| s.as_str()).unwrap_or("");
+            let code = totp_code.as_deref().unwrap_or("");
             let two_factor_service = crate::services::two_factor_service::TwoFactorService::new(self.db.clone());
             if !two_factor_service.verify_totp(user_id, code).await.unwrap_or(false) {
                 return Err(crate::errors::AppError::AuthenticationError("Invalid or missing 2FA code".to_string()));
@@ -137,7 +137,7 @@ impl UserService {
             return Err(crate::errors::AppError::AuthenticationError("Incorrect password".to_string()));
         }
         if user.totp_enabled {
-            let code = totp_code.as_ref().map(|s| s.as_str()).unwrap_or("");
+            let code = totp_code.as_deref().unwrap_or("");
             let two_factor_service = crate::services::two_factor_service::TwoFactorService::new(self.db.clone());
             if !two_factor_service.verify_totp(user_id, code).await.unwrap_or(false) {
                 return Err(crate::errors::AppError::AuthenticationError("Invalid or missing 2FA code".to_string()));
