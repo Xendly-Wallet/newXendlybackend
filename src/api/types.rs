@@ -252,6 +252,28 @@ pub struct UpdatePhoneRequest {
     pub phone_number: String,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SendPhoneVerificationRequest {
+    pub phone_number: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SendPhoneVerificationResponse {
+    pub message: String,
+    pub success: bool,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct VerifyPhoneCodeRequest {
+    pub code: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct VerifyPhoneCodeResponse {
+    pub success: bool,
+    pub message: String,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TwoFAStatusResponse {
     pub enabled: bool,
@@ -277,4 +299,53 @@ pub struct Enable2FAResponse {
     pub success: bool,
     pub message: String,
     pub backup_codes: Vec<String>,
+} 
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct KycSubmitRequest {
+    pub full_name: String,
+    pub id_type: String,
+    pub id_number: String,
+    pub id_photo_url: String, // For MVP, accept a file path or base64 string
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct KycStatusResponse {
+    pub status: String,
+    pub rejection_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct KycSubmissionResponse {
+    pub id: Uuid,
+    pub full_name: String,
+    pub id_type: String,
+    pub id_number: String,
+    pub id_photo_url: String,
+    pub status: String,
+    pub submitted_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub reviewed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub rejection_reason: Option<String>,
+} 
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct KycFileUploadResponse {
+    pub file_url: String,
+} 
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct KycAdminListResponse {
+    pub submissions: Vec<KycSubmissionResponse>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct KycReviewRequest {
+    pub status: String, // "approved" or "rejected"
+    pub rejection_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct KycReviewResponse {
+    pub success: bool,
+    pub message: String,
 } 

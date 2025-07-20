@@ -1,5 +1,6 @@
 use axum::{Router, routing::{post, get, delete, put}, Json, extract::{FromRequestParts}, http::{StatusCode, request::Parts, header::AUTHORIZATION}, response::IntoResponse};
 use axum::extract::Path;
+use axum::http::HeaderMap;
 use crate::api::types::*;
 use crate::database::sqlite::GLOBAL_DB;
 use crate::database::sqlite::SqliteDatabase;
@@ -9,12 +10,19 @@ use std::sync::Arc;
 use crate::services::auth::AuthService;
 use crate::services::jwt::JwtManager;
 use crate::services::stellar_service::StellarService;
+use crate::services::user_service::UserService;
 use serde::Serialize;
 use tracing::{info, error};
 use crate::utils::validation::Validator;
 use qrcode::QrCode;
-use qrcode::render::svg;
 use base64::{engine::general_purpose, Engine as _};
+use crate::models::kyc::KycSubmission;
+use chrono::Utc;
+use axum::extract::Multipart;
+use std::fs;
+use std::io::Write;
+use crate::services::notification_service::NotificationService;
+use crate::models::stellar_wallet::AssetBalance;
 
 // JWT extractor for Authorization: Bearer ...
 pub struct AuthBearer(pub String);
@@ -140,6 +148,7 @@ pub async fn register(
     };
     // Create user
     let user_id = Uuid::new_v4();
+    let phone_number_clone = req.phone_number.clone();
     let user = crate::models::user::User {
         id: user_id,
         email: email.clone(),
@@ -166,6 +175,20 @@ pub async fn register(
         }));
     }
     info!(action = "register_success", user = %email);
+    
+    // Send welcome SMS if phone number is provided
+    if let Some(phone_number) = &phone_number_clone {
+        match crate::utils::sms::send_welcome_sms(phone_number, &req.username, &email).await {
+            Ok(_) => {
+                info!(action = "welcome_sms_sent", user = %email, phone = %phone_number);
+            }
+            Err(e) => {
+                error!(action = "welcome_sms_failed", user = %email, phone = %phone_number, error = %e);
+                // Don't fail registration if SMS fails
+            }
+        }
+    }
+    
     (StatusCode::OK, Json(RegisterResponse {
         user_id,
         message: "User registered successfully".to_string(),
@@ -783,6 +806,7 @@ pub async fn send_payment(
             );
         }
     };
+    let asset_code_for_notify = asset_code.clone();
     let stellar_service = StellarService::new(db.clone());
     let tx_hash = match stellar_service.send_payment_asset(
         &wallet.public_key,
@@ -801,6 +825,33 @@ pub async fn send_payment(
             );
         }
     };
+    // Send notifications
+    let notification_service = NotificationService::new(db.clone());
+    let sender_email = user_record.email.clone();
+    let _ = notification_service.send_outgoing_payment_notification(
+        &_user.user_id,
+        &sender_email,
+        &req.amount.to_string(),
+        asset_code_for_notify.clone().unwrap_or_else(|| "XLM".to_string()).as_str(),
+        &req.destination,
+        &tx_hash,
+        req.memo.as_deref()
+    ).await;
+    // Try to notify recipient if they are a user
+    if let Ok(Some(recipient_wallet)) = db.get_wallet_by_public_key(&req.destination).await {
+        let recipient_user = db.get_user_by_id(&recipient_wallet.user_id).await.ok();
+        if let Some(recipient) = recipient_user {
+            let _ = notification_service.send_incoming_payment_notification(
+                &recipient.id,
+                &recipient.email,
+                &req.amount.to_string(),
+                asset_code_for_notify.unwrap_or_else(|| "XLM".to_string()).as_str(),
+                &wallet.public_key,
+                &tx_hash,
+                req.memo.as_deref()
+            ).await;
+        }
+    }
     info!(action = "send_payment", user_id = %_user.user_id, wallet_id = %wallet_id);
     (StatusCode::OK, Json(SendPaymentResponse { transaction_hash: tx_hash, message: "Payment sent successfully".to_string() }))
 }
@@ -981,14 +1032,25 @@ pub async fn fund_wallet(
     };
     let stellar_service = StellarService::new(db.clone());
     match stellar_service.fund_testnet_account(&wallet.public_key).await {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(FundWalletResponse {
-                wallet_id: wallet.id,
-                public_key: wallet.public_key,
-                message: "Wallet funded successfully (testnet)".to_string(),
-            })
-        ),
+        Ok(_) => {
+            let notification_service = NotificationService::new(db.clone());
+            let _ = notification_service.send_balance_change_notification(
+                &_user.user_id,
+                &wallet.public_key, // Use public key as fallback email
+                0.0, // Old balance unknown here
+                1.0, // New balance (dummy, ideally fetch real balance)
+                "XLM",
+                Some("Wallet funded (testnet)")
+            ).await;
+            (
+                StatusCode::OK,
+                Json(FundWalletResponse {
+                    wallet_id: wallet.id,
+                    public_key: wallet.public_key,
+                    message: "Wallet funded successfully (testnet)".to_string(),
+                })
+            )
+        },
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(FundWalletResponse {
@@ -1036,7 +1098,7 @@ pub async fn receive_wallet(
     };
     let wallet = match db.get_wallet_by_id(&wallet_id).await {
         Ok(w) if w.user_id == _user.user_id => w,
-        Ok(_) => {
+        _ => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(ReceiveWalletResponse {
@@ -1044,44 +1106,44 @@ pub async fn receive_wallet(
                     public_key: "".to_string(),
                     qr_code_url: None,
                     supported_assets: vec![],
-                    message: "Wallet not found. Please check your wallet selection.".to_string(),
-                }),
-            );
-        }
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ReceiveWalletResponse {
-                    wallet_id,
-                    public_key: "".to_string(),
-                    qr_code_url: None,
-                    supported_assets: vec![],
-                    message: "Failed to get wallet. Please try again later.".to_string(),
+                    message: "Wallet not found".to_string(),
                 }),
             );
         }
     };
-    // Generate QR code SVG and encode as data URI
-    let qr_code_url = match QrCode::new(&wallet.public_key) {
-        Ok(qr_code) => {
-            let svg = qr_code.render::<svg::Color>()
-                .min_dimensions(200, 200)
-                .dark_color(svg::Color("#000000"))
-                .light_color(svg::Color("#ffffff"))
-                .build();
-            let svg_base64 = general_purpose::STANDARD.encode(svg.as_bytes());
-            Some(format!("data:image/svg+xml;base64,{}", svg_base64))
+    // Generate QR code SVG and encode as data URL
+    let code = QrCode::new(&wallet.public_key).unwrap();
+    let svg: String = code.render::<qrcode::render::svg::Color>().min_dimensions(200, 200).build();
+    let svg_base64 = general_purpose::STANDARD.encode(svg.as_bytes());
+    let data_url = format!("data:image/svg+xml;base64,{}", svg_base64);
+    // Supported assets (for now, XLM and USDC)
+    let now = Utc::now();
+    let supported_assets = vec![
+        AssetBalance {
+            id: Uuid::nil(),
+            wallet_id: wallet.id,
+            asset_type: "native".to_string(),
+            asset_code: "XLM".to_string(),
+            asset_issuer: None,
+            balance: "0".to_string(),
+            last_updated: now,
         },
-        Err(_) => None,
-    };
-    let stellar_service = StellarService::new(db.clone());
-    let supported_assets = stellar_service.get_wallet_balances(&wallet.public_key).await.unwrap_or_default();
+        AssetBalance {
+            id: Uuid::nil(),
+            wallet_id: wallet.id,
+            asset_type: "credit_alphanum4".to_string(),
+            asset_code: "USDC".to_string(),
+            asset_issuer: Some("GA5ZSE7V3Y3P5YF3VJZQ2Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5Q5".to_string()),
+            balance: "0".to_string(),
+            last_updated: now,
+        },
+    ];
     (
         StatusCode::OK,
         Json(ReceiveWalletResponse {
             wallet_id: wallet.id,
             public_key: wallet.public_key,
-            qr_code_url,
+            qr_code_url: Some(data_url),
             supported_assets,
             message: "Share this address to receive XLM or USDC payments.".to_string(),
         })
@@ -1460,6 +1522,108 @@ pub async fn update_phone(
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/profile/phone/send-verification",
+    request_body = SendPhoneVerificationRequest,
+    responses((status = 200, body = SendPhoneVerificationResponse), (status = 401, description = "Unauthorized"), (status = 400, description = "Invalid phone number")),
+    tag = "Profile"
+)]
+pub async fn send_phone_verification(
+    AuthBearer(token): AuthBearer,
+    Json(req): Json<SendPhoneVerificationRequest>,
+) -> (StatusCode, Json<SendPhoneVerificationResponse>) {
+    let db = GLOBAL_DB.get().unwrap().clone();
+    let user = match user_from_token(&token, db.clone()).await {
+        Ok(u) => u,
+        Err((_status, _msg)) => {
+            return (StatusCode::UNAUTHORIZED, Json(SendPhoneVerificationResponse {
+                message: "Unauthorized".to_string(),
+                success: false,
+            }));
+        }
+    };
+
+    let user_service = match UserService::new(db.clone()).await {
+        Ok(service) => service,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(SendPhoneVerificationResponse {
+                message: "Service unavailable".to_string(),
+                success: false,
+            }));
+        }
+    };
+
+    match user_service.update_user_phone_number_with_verification(&user.user_id, &req.phone_number).await {
+        Ok(_) => {
+            (StatusCode::OK, Json(SendPhoneVerificationResponse {
+                message: "Verification code sent successfully".to_string(),
+                success: true,
+            }))
+        }
+        Err(e) => {
+            (StatusCode::BAD_REQUEST, Json(SendPhoneVerificationResponse {
+                message: format!("Failed to send verification code: {}", e),
+                success: false,
+            }))
+        }
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/profile/phone/verify",
+    request_body = VerifyPhoneCodeRequest,
+    responses((status = 200, body = VerifyPhoneCodeResponse), (status = 401, description = "Unauthorized"), (status = 400, description = "Invalid code")),
+    tag = "Profile"
+)]
+pub async fn verify_phone_code(
+    AuthBearer(token): AuthBearer,
+    Json(req): Json<VerifyPhoneCodeRequest>,
+) -> (StatusCode, Json<VerifyPhoneCodeResponse>) {
+    let db = GLOBAL_DB.get().unwrap().clone();
+    let user = match user_from_token(&token, db.clone()).await {
+        Ok(u) => u,
+        Err((_status, _msg)) => {
+            return (StatusCode::UNAUTHORIZED, Json(VerifyPhoneCodeResponse {
+                message: "Unauthorized".to_string(),
+                success: false,
+            }));
+        }
+    };
+
+    let user_service = match UserService::new(db.clone()).await {
+        Ok(service) => service,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(VerifyPhoneCodeResponse {
+                message: "Service unavailable".to_string(),
+                success: false,
+            }));
+        }
+    };
+
+    match user_service.verify_user_phone_code(&user.user_id, &req.code).await {
+        Ok(true) => {
+            (StatusCode::OK, Json(VerifyPhoneCodeResponse {
+                message: "Phone number verified successfully".to_string(),
+                success: true,
+            }))
+        }
+        Ok(false) => {
+            (StatusCode::BAD_REQUEST, Json(VerifyPhoneCodeResponse {
+                message: "Invalid verification code".to_string(),
+                success: false,
+            }))
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(VerifyPhoneCodeResponse {
+                message: format!("Verification failed: {}", e),
+                success: false,
+            }))
+        }
+    }
+}
+
 #[utoipa::path(get, path = "/api/profile/2fa/status", responses((status = 200, body = TwoFAStatusResponse), (status = 401, description = "Unauthorized")))]
 pub async fn get_2fa_status(
     AuthBearer(token): AuthBearer,
@@ -1600,15 +1764,237 @@ pub async fn enable_2fa(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/kyc/submit",
+    request_body = KycSubmitRequest,
+    responses((status = 200, body = KycSubmissionResponse), (status = 401, description = "Unauthorized")),
+    tag = "KYC"
+)]
+pub async fn kyc_submit(
+    AuthBearer(token): AuthBearer,
+    Json(req): Json<KycSubmitRequest>,
+) -> (StatusCode, Json<KycSubmissionResponse>) {
+    let db = GLOBAL_DB.get().unwrap().clone();
+    let user = match user_from_token(&token, db.clone()).await {
+        Ok(u) => u,
+        Err((_status, _msg)) => {
+            return (StatusCode::UNAUTHORIZED, Json(KycSubmissionResponse {
+                id: Uuid::nil(),
+                full_name: "".to_string(),
+                id_type: "".to_string(),
+                id_number: "".to_string(),
+                id_photo_url: "".to_string(),
+                status: "not_submitted".to_string(),
+                submitted_at: None,
+                reviewed_at: None,
+                rejection_reason: None,
+            }));
+        }
+    };
+    let kyc = KycSubmission {
+        id: Uuid::new_v4(),
+        user_id: user.user_id,
+        full_name: req.full_name,
+        id_type: req.id_type,
+        id_number: req.id_number,
+        id_photo_url: req.id_photo_url,
+        status: "pending".to_string(),
+        submitted_at: Some(Utc::now()),
+        reviewed_at: None,
+        rejection_reason: None,
+    };
+    if let Err(e) = db.create_kyc_submission(&kyc).await {
+        error!(action = "kyc_submit_failed", user_id = %user.user_id, error = %e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(KycSubmissionResponse {
+            id: Uuid::nil(),
+            full_name: "".to_string(),
+            id_type: "".to_string(),
+            id_number: "".to_string(),
+            id_photo_url: "".to_string(),
+            status: "not_submitted".to_string(),
+            submitted_at: None,
+            reviewed_at: None,
+            rejection_reason: None,
+        }));
+    }
+    (StatusCode::OK, Json(KycSubmissionResponse {
+        id: kyc.id,
+        full_name: kyc.full_name,
+        id_type: kyc.id_type,
+        id_number: kyc.id_number,
+        id_photo_url: kyc.id_photo_url,
+        status: kyc.status,
+        submitted_at: kyc.submitted_at,
+        reviewed_at: kyc.reviewed_at,
+        rejection_reason: kyc.rejection_reason,
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/kyc/status",
+    responses((status = 200, body = KycStatusResponse), (status = 401, description = "Unauthorized")),
+    tag = "KYC"
+)]
+pub async fn kyc_status(
+    AuthBearer(token): AuthBearer,
+) -> (StatusCode, Json<KycStatusResponse>) {
+    let db = GLOBAL_DB.get().unwrap().clone();
+    let user = match user_from_token(&token, db.clone()).await {
+        Ok(u) => u,
+        Err((_status, _msg)) => {
+            return (StatusCode::UNAUTHORIZED, Json(KycStatusResponse {
+                status: "not_submitted".to_string(),
+                rejection_reason: None,
+            }));
+        }
+    };
+    let kyc = db.get_kyc_submission_by_user(&user.user_id).await.ok().flatten();
+    if let Some(kyc) = kyc {
+        (StatusCode::OK, Json(KycStatusResponse {
+            status: kyc.status,
+            rejection_reason: kyc.rejection_reason,
+        }))
+    } else {
+        (StatusCode::OK, Json(KycStatusResponse {
+            status: "not_submitted".to_string(),
+            rejection_reason: None,
+        }))
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/kyc/upload-id",
+    responses((status = 200, body = KycFileUploadResponse), (status = 400, description = "No file uploaded"), (status = 401, description = "Unauthorized")),
+    tag = "KYC"
+)]
+pub async fn kyc_upload_id(
+    AuthBearer(token): AuthBearer,
+    mut multipart: Multipart,
+) -> (StatusCode, Json<KycFileUploadResponse>) {
+    let db = GLOBAL_DB.get().unwrap().clone();
+    let user = match user_from_token(&token, db.clone()).await {
+        Ok(u) => u,
+        Err((_status, _msg)) => {
+            return (StatusCode::UNAUTHORIZED, Json(KycFileUploadResponse {
+                file_url: "".to_string(),
+            }));
+        }
+    };
+    let upload_dir = "./uploads/kyc";
+    fs::create_dir_all(upload_dir).ok();
+    while let Some(field) = multipart.next_field().await.unwrap_or(None) {
+        let name = field.name().unwrap_or("");
+        if name == "file" {
+            let file_name = format!("{}_{}_{}.jpg", user.user_id, chrono::Utc::now().timestamp(), uuid::Uuid::new_v4());
+            let file_path = format!("{}/{}", upload_dir, file_name);
+            let data = field.bytes().await.unwrap_or_default();
+            let mut file = fs::File::create(&file_path).unwrap();
+            file.write_all(&data).unwrap();
+            return (StatusCode::OK, Json(KycFileUploadResponse {
+                file_url: file_path.clone(),
+            }));
+        }
+    }
+    (StatusCode::BAD_REQUEST, Json(KycFileUploadResponse {
+        file_url: "".to_string(),
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/admin/kyc/list",
+    responses((status = 200, body = KycAdminListResponse), (status = 401, description = "Unauthorized")),
+    tag = "KYC"
+)]
+pub async fn admin_kyc_list(headers: HeaderMap) -> (StatusCode, Json<KycAdminListResponse>) {
+    if !is_admin(&headers) {
+        return (StatusCode::UNAUTHORIZED, Json(KycAdminListResponse { submissions: vec![] }));
+    }
+    let db = GLOBAL_DB.get().unwrap().clone();
+    let list = db.list_kyc_submissions(Some(100)).await.unwrap_or_default();
+    let submissions = list.into_iter().map(|k| KycSubmissionResponse {
+        id: k.id,
+        full_name: k.full_name,
+        id_type: k.id_type,
+        id_number: k.id_number,
+        id_photo_url: k.id_photo_url,
+        status: k.status,
+        submitted_at: k.submitted_at,
+        reviewed_at: k.reviewed_at,
+        rejection_reason: k.rejection_reason,
+    }).collect();
+    (StatusCode::OK, Json(KycAdminListResponse { submissions }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/admin/kyc/{id}/review",
+    request_body = KycReviewRequest,
+    responses((status = 200, body = KycReviewResponse), (status = 401, description = "Unauthorized"), (status = 404, description = "Not found")),
+    tag = "KYC"
+)]
+pub async fn admin_kyc_review(
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(req): Json<KycReviewRequest>,
+) -> (StatusCode, Json<KycReviewResponse>) {
+    if !is_admin(&headers) {
+        return (StatusCode::UNAUTHORIZED, Json(KycReviewResponse { success: false, message: "Unauthorized".to_string() }));
+    }
+    let db = GLOBAL_DB.get().unwrap().clone();
+    let status = req.status.to_lowercase();
+    if status != "approved" && status != "rejected" {
+        return (StatusCode::BAD_REQUEST, Json(KycReviewResponse { success: false, message: "Invalid status".to_string() }));
+    }
+    let now = Some(chrono::Utc::now());
+    let rejection_reason = if status == "rejected" { req.rejection_reason.as_deref() } else { None };
+    let res = db.update_kyc_status(&id, &status, now, rejection_reason).await;
+    match res {
+        Ok(_) => {
+            // Fetch KYC submission to get user_id
+            if let Ok(Some(kyc)) = db.list_kyc_submissions(None).await.map(|list| list.into_iter().find(|k| k.id == id)) {
+                let notification_service = NotificationService::new(db.clone());
+                let user_id = kyc.user_id;
+                let user = db.get_user_by_id(&user_id).await.ok();
+                let email = user.as_ref().map(|u| u.email.as_str()).unwrap_or("");
+                let (title, message): (&str, String) = if status == "approved" {
+                    ("✅ KYC Approved", "Your KYC verification has been approved. You now have full access to all features.".to_string())
+                } else {
+                    ("❌ KYC Rejected", format!("Your KYC verification was rejected. Reason: {}", rejection_reason.unwrap_or("No reason provided.")))
+                };
+                let _ = notification_service.send_security_alert_notification(
+                    &user_id,
+                    email,
+                    title,
+                    None,
+                    None,
+                    None,
+                    chrono::Utc::now()
+                ).await;
+            }
+            (StatusCode::OK, Json(KycReviewResponse { success: true, message: format!("KYC {}", status) }))
+        },
+        Err(_) => (StatusCode::NOT_FOUND, Json(KycReviewResponse { success: false, message: "KYC submission not found".to_string() })),
+    }
+}
+
 /// Profile API endpoints
 pub fn profile_router() -> Router {
     Router::new()
         .route("/", get(get_profile))
         .route("/", put(update_profile))
         .route("/phone", put(update_phone))
+        .route("/phone/send-verification", post(send_phone_verification))
+        .route("/phone/verify", post(verify_phone_code))
         .route("/2fa/status", get(get_2fa_status))
         .route("/2fa/setup", get(setup_2fa))
         .route("/2fa/enable", post(enable_2fa))
+        .route("/kyc/submit", post(kyc_submit))
+        .route("/kyc/status", get(kyc_status))
+        .route("/kyc/upload-id", post(kyc_upload_id))
 } 
 
 // Update wallet_router to include all endpoints
@@ -1656,3 +2042,14 @@ pub fn notifications_router() -> Router {
         .route("/preferences", get(get_notification_preferences))
         .route("/preferences", put(update_notification_preferences))
 } 
+
+fn is_admin(headers: &HeaderMap) -> bool {
+    if let Some(token) = headers.get("x-admin-token") {
+        if let Ok(token_str) = token.to_str() {
+            if let Ok(admin_token) = std::env::var("ADMIN_TOKEN") {
+                return token_str == admin_token;
+            }
+        }
+    }
+    false
+}

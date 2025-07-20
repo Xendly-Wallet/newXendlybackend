@@ -94,6 +94,7 @@ async fn run_interactive() -> Result<(), Box<dyn std::error::Error>> {
         println!("10. 📋 View Notifications");
         println!("11. 👤 Profile Management");
         println!("12. 🔔 Notifications Menu");
+        println!("13. 📱 Test SMS Credentials");
         println!("{}", "─".repeat(40).blue());
         println!("0. 🚪 Exit");
         
@@ -272,6 +273,14 @@ async fn run_interactive() -> Result<(), Box<dyn std::error::Error>> {
                         "0" => break,
                         _ => CLI::print_error("Invalid option. Please try again."),
                     }
+                }
+            }
+            "13" => {
+                // Test SMS Credentials
+                println!("{}", "📱 Testing SMS Credentials...".cyan().bold());
+                match crate::utils::sms::test_africastalking_credentials().await {
+                    Ok(_) => println!("{}", "✅ SMS test completed successfully!".green()),
+                    Err(e) => println!("{}", format!("❌ SMS test failed: {}", e).red()),
                 }
             }
             "0" => {

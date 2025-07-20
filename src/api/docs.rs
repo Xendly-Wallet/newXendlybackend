@@ -157,6 +157,44 @@ pub fn generate_markdown_docs() -> String {
     markdown.push_str("### PUT /api/notifications/preferences\n\n");
     markdown.push_str("**Description:** Update notification preferences\n\n");
     
+    // KYC endpoints
+    markdown.push_str("## KYC (Know Your Customer)\n\n");
+    markdown.push_str("### POST /api/kyc/upload-id\n\n");
+    markdown.push_str("**Description:** Upload an ID photo for KYC (multipart/form-data, field name 'file').\n\n");
+    markdown.push_str("**Response:**\n```
+{\n  \"file_url\": \"/uploads/kyc/uuid_timestamp_uuid.jpg\"\n}\n```
+\n");
+
+    markdown.push_str("### POST /api/kyc/submit\n\n");
+    markdown.push_str("**Description:** Submit KYC info (full name, ID type, ID number, file path from upload).\n\n");
+    markdown.push_str("**Request Body:**\n```
+{\n  \"full_name\": \"Jane Doe\",\n  \"id_type\": \"Passport\",\n  \"id_number\": \"A1234567\",\n  \"id_photo_url\": \"/uploads/kyc/uuid_timestamp_uuid.jpg\"\n}\n```
+\n");
+    markdown.push_str("**Response:**\n```
+{\n  \"id\": \"uuid\",\n  \"full_name\": \"Jane Doe\",\n  \"id_type\": \"Passport\",\n  \"id_number\": \"A1234567\",\n  \"id_photo_url\": \"/uploads/kyc/uuid_timestamp_uuid.jpg\",\n  \"status\": \"pending\",\n  \"submitted_at\": \"2024-01-01T00:00:00Z\",\n  \"reviewed_at\": null,\n  \"rejection_reason\": null\n}\n```
+\n");
+
+    markdown.push_str("### GET /api/kyc/status\n\n");
+    markdown.push_str("**Description:** Get current user's KYC status.\n\n");
+    markdown.push_str("**Response:**\n```
+{\n  \"status\": \"pending\",\n  \"rejection_reason\": null\n}\n```
+\n");
+
+    markdown.push_str("### GET /api/admin/kyc/list\n\n");
+    markdown.push_str("**Description:** List all KYC submissions (admin only, requires X-Admin-Token header).\n\n");
+    markdown.push_str("**Response:**\n```
+{\n  \"submissions\": [ ... ]\n}\n```
+\n");
+
+    markdown.push_str("### POST /api/admin/kyc/{id}/review\n\n");
+    markdown.push_str("**Description:** Approve or reject a KYC submission (admin only, requires X-Admin-Token header).\n\n");
+    markdown.push_str("**Request Body:**\n```
+{\n  \"status\": \"approved\",\n  \"rejection_reason\": null\n}\n```
+\n");
+    markdown.push_str("**Response:**\n```
+{\n  \"success\": true,\n  \"message\": \"KYC approved\"\n}\n```
+\n");
+    
     // Error codes
     markdown.push_str("## Error Codes\n\n");
     markdown.push_str("| Code | Description |\n");
@@ -654,6 +692,45 @@ pub fn generate_documentation_html() -> String {
                 <div class="endpoint-url">Update notification preferences</div>
                 <div class="description">Updates user's notification preferences.</div>
                 <div class="auth-note">🔒 Requires JWT</div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <h2>🔔 KYC Endpoints</h2>
+            
+            <div class="endpoint">
+                <h3><span class="method post">POST</span> /api/kyc/upload-id</h3>
+                <div class="endpoint-url">Upload an ID photo for KYC</div>
+                <div class="description">Uploads an ID photo for KYC verification (multipart/form-data, field name 'file').</div>
+                <div class="auth-note">🔒 Requires JWT</div>
+            </div>
+
+            <div class="endpoint">
+                <h3><span class="method post">POST</span> /api/kyc/submit</h3>
+                <div class="endpoint-url">Submit KYC information</div>
+                <div class="description">Submits KYC information (full name, ID type, ID number, file path) for review.</div>
+                <div class="auth-note">🔒 Requires JWT</div>
+            </div>
+
+            <div class="endpoint">
+                <h3><span class="method get">GET</span> /api/kyc/status</h3>
+                <div class="endpoint-url">Get KYC status</div>
+                <div class="description">Gets the current user's KYC status.</div>
+                <div class="auth-note">🔒 Requires JWT</div>
+            </div>
+
+            <div class="endpoint">
+                <h3><span class="method get">GET</span> /api/admin/kyc/list</h3>
+                <div class="endpoint-url">List KYC submissions (admin only)</div>
+                <div class="description">Lists all KYC submissions for admin review (requires X-Admin-Token header).</div>
+                <div class="auth-note">🔒 Requires JWT (Admin)</div>
+            </div>
+
+            <div class="endpoint">
+                <h3><span class="method post">POST</span> /api/admin/kyc/{id}/review</h3>
+                <div class="endpoint-url">Review KYC submission (admin only)</div>
+                <div class="description">Reviews a specific KYC submission (approve or reject) by ID (admin only, requires X-Admin-Token header).</div>
+                <div class="auth-note">🔒 Requires JWT (Admin)</div>
             </div>
         </div>
         

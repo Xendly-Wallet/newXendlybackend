@@ -121,8 +121,16 @@ impl UserService {
         // Store the verification code and phone number
         self.db.update_user_phone_number_with_verification(user_id, phone_number, &verification_code).await?;
         
-        // TODO: Send SMS with verification code
-        println!("📱 Verification code sent to {}: {}", phone_number, verification_code);
+        // Send SMS with verification code using Africa's Talking
+        match crate::utils::sms::send_verification_sms(phone_number, &verification_code).await {
+            Ok(_) => {
+                println!("📱 Verification code sent to {} via SMS", phone_number);
+            }
+            Err(e) => {
+                println!("⚠️  Failed to send SMS: {}. Code: {}", e, verification_code);
+                // Don't fail the operation, just log the error
+            }
+        }
         
         Ok(verification_code)
     }

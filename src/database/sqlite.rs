@@ -1,5 +1,6 @@
 use crate::errors::{AppError, Result};
 use crate::models::user::User;
+use crate::models::kyc::KycSubmission;
 use sqlx::{SqlitePool, Row};
 use uuid::Uuid;
 use std::path::Path;
@@ -184,6 +185,20 @@ impl SqliteDatabase {
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS kyc_submissions (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                full_name TEXT NOT NULL,
+                id_type TEXT NOT NULL,
+                id_number TEXT NOT NULL,
+                id_photo_url TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'not_submitted',
+                submitted_at TEXT,
+                reviewed_at TEXT,
+                rejection_reason TEXT,
+                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
             CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
             CREATE INDEX IF NOT EXISTS idx_tokens_user_id ON user_tokens(user_id);
@@ -209,105 +224,7 @@ impl SqliteDatabase {
         println!("📋 Database tables created/verified");
         Ok(())
     }
-    #[allow(dead_code)]
-    async fn create_users_table(&self) -> Result<()> {
-        let query = r#"
-        CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY,
-            username TEXT UNIQUE NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )"#;
 
-        sqlx::query(query)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| AppError::DatabaseError(format!("Failed to create users table: {}", e)))?;
-
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    async fn create_stellar_wallets_table(&self) -> Result<()> {
-        let query = r#"
-        CREATE TABLE IF NOT EXISTS stellar_wallets (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            public_key TEXT UNIQUE NOT NULL,
-            encrypted_secret_key TEXT NOT NULL,
-            wallet_name TEXT NOT NULL,
-            is_active BOOLEAN NOT NULL DEFAULT TRUE,
-            balance_xlm TEXT,
-            sequence_number INTEGER,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            last_sync_at TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )"#;
-
-        sqlx::query(query)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| AppError::DatabaseError(format!("Failed to create stellar_wallets table: {}", e)))?;
-
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    async fn create_wallet_transactions_table(&self) -> Result<()> {
-        let query = r#"
-        CREATE TABLE IF NOT EXISTS wallet_transactions (
-            id TEXT PRIMARY KEY,
-            wallet_id TEXT NOT NULL,
-            transaction_hash TEXT NOT NULL,
-            transaction_type TEXT NOT NULL,
-            amount TEXT NOT NULL,
-            asset_code TEXT NOT NULL,
-            asset_issuer TEXT,
-            from_address TEXT NOT NULL,
-            to_address TEXT NOT NULL,
-            memo TEXT,
-            fee TEXT NOT NULL,
-            status TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            confirmed_at TEXT,
-            FOREIGN KEY (wallet_id) REFERENCES stellar_wallets(id)
-        )"#;
-
-        sqlx::query(query)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| AppError::DatabaseError(format!("Failed to create wallet_transactions table: {}", e)))?;
-
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    async fn create_asset_balances_table(&self) -> Result<()> {
-        let query = r#"
-        CREATE TABLE IF NOT EXISTS asset_balances (
-            id TEXT PRIMARY KEY,
-            wallet_id TEXT NOT NULL,
-            asset_type TEXT NOT NULL,
-            asset_code TEXT NOT NULL,
-            asset_issuer TEXT,
-            balance TEXT NOT NULL,
-            last_updated TEXT NOT NULL,
-            FOREIGN KEY (wallet_id) REFERENCES stellar_wallets(id),
-            UNIQUE(wallet_id, asset_code, asset_issuer)
-        )"#;
-
-        sqlx::query(query)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| AppError::DatabaseError(format!("Failed to create asset_balances table: {}", e)))?;
-
-        Ok(())
-    }
-
-    // Your existing methods...
     pub async fn create_user(&self, user: &User) -> Result<()> {
         let query = r#"
             INSERT INTO users (id, email, username, password_hash, is_verified, stellar_public_key, phone_number, is_phone_verified, phone_verification_code, phone_verified_at, totp_secret, totp_enabled, backup_codes, is_deleted, created_at, updated_at)
@@ -1494,6 +1411,94 @@ impl SqliteDatabase {
             .await
             .map_err(|e| AppError::DatabaseError(format!("Failed to delete user: {}", e)))?;
 
+        Ok(())
+    }
+
+    pub async fn create_kyc_submission(&self, kyc: &KycSubmission) -> Result<()> {
+        let query = r#"
+            INSERT INTO kyc_submissions (id, user_id, full_name, id_type, id_number, id_photo_url, status, submitted_at, reviewed_at, rejection_reason)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "#;
+        sqlx::query(query)
+            .bind(kyc.id.to_string())
+            .bind(kyc.user_id.to_string())
+            .bind(&kyc.full_name)
+            .bind(&kyc.id_type)
+            .bind(&kyc.id_number)
+            .bind(&kyc.id_photo_url)
+            .bind(&kyc.status)
+            .bind(kyc.submitted_at.map(|dt| dt.to_rfc3339()))
+            .bind(kyc.reviewed_at.map(|dt| dt.to_rfc3339()))
+            .bind(&kyc.rejection_reason)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Failed to create KYC submission: {}", e)))?;
+        Ok(())
+    }
+
+    pub async fn get_kyc_submission_by_user(&self, user_id: &Uuid) -> Result<Option<KycSubmission>> {
+        let query = r#"
+            SELECT * FROM kyc_submissions WHERE user_id = ?1 ORDER BY submitted_at DESC LIMIT 1
+        "#;
+        let row = sqlx::query(query)
+            .bind(user_id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Failed to fetch KYC submission: {}", e)))?;
+        if let Some(row) = row {
+            Ok(Some(KycSubmission {
+                id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap(),
+                user_id: Uuid::parse_str(&row.get::<String, _>("user_id")).unwrap(),
+                full_name: row.get("full_name"),
+                id_type: row.get("id_type"),
+                id_number: row.get("id_number"),
+                id_photo_url: row.get("id_photo_url"),
+                status: row.get("status"),
+                submitted_at: row.get::<Option<String>, _>("submitted_at").and_then(|s| s.parse().ok()),
+                reviewed_at: row.get::<Option<String>, _>("reviewed_at").and_then(|s| s.parse().ok()),
+                rejection_reason: row.get("rejection_reason"),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn list_kyc_submissions(&self, limit: Option<i64>) -> Result<Vec<KycSubmission>> {
+        let query = if let Some(lim) = limit {
+            format!("SELECT * FROM kyc_submissions ORDER BY submitted_at DESC LIMIT {}", lim)
+        } else {
+            "SELECT * FROM kyc_submissions ORDER BY submitted_at DESC".to_string()
+        };
+        let rows = sqlx::query(&query)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Failed to list KYC submissions: {}", e)))?;
+        Ok(rows.into_iter().map(|row| KycSubmission {
+            id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap(),
+            user_id: Uuid::parse_str(&row.get::<String, _>("user_id")).unwrap(),
+            full_name: row.get("full_name"),
+            id_type: row.get("id_type"),
+            id_number: row.get("id_number"),
+            id_photo_url: row.get("id_photo_url"),
+            status: row.get("status"),
+            submitted_at: row.get::<Option<String>, _>("submitted_at").and_then(|s| s.parse().ok()),
+            reviewed_at: row.get::<Option<String>, _>("reviewed_at").and_then(|s| s.parse().ok()),
+            rejection_reason: row.get("rejection_reason"),
+        }).collect())
+    }
+
+    pub async fn update_kyc_status(&self, kyc_id: &Uuid, status: &str, reviewed_at: Option<DateTime<Utc>>, rejection_reason: Option<&str>) -> Result<()> {
+        let query = r#"
+            UPDATE kyc_submissions SET status = ?1, reviewed_at = ?2, rejection_reason = ?3 WHERE id = ?4
+        "#;
+        sqlx::query(query)
+            .bind(status)
+            .bind(reviewed_at.map(|dt| dt.to_rfc3339()))
+            .bind(rejection_reason)
+            .bind(kyc_id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Failed to update KYC status: {}", e)))?;
         Ok(())
     }
 }

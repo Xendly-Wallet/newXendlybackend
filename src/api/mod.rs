@@ -55,9 +55,14 @@ pub mod docs;
         routes::get_profile,
         routes::update_profile,
         routes::update_phone,
+        routes::send_phone_verification,
+        routes::verify_phone_code,
         routes::get_2fa_status,
         routes::setup_2fa,
         routes::enable_2fa,
+        routes::kyc_upload_id,
+        routes::admin_kyc_list,
+        routes::admin_kyc_review,
     ),
     components(
         schemas(
@@ -95,6 +100,10 @@ pub mod docs;
             types::ProfileResponse,
             types::UpdateProfileRequest,
             types::UpdatePhoneRequest,
+            types::SendPhoneVerificationRequest,
+            types::SendPhoneVerificationResponse,
+            types::VerifyPhoneCodeRequest,
+            types::VerifyPhoneCodeResponse,
             types::TwoFAStatusResponse,
             types::TwoFASetupResponse,
             types::Enable2FARequest,
@@ -194,6 +203,8 @@ pub async fn start_http_server() {
         )
         .route("/api/assets", axum::routing::get(routes::list_supported_assets))
         .route("/health", axum::routing::get(health_check))
+        .route("/api/admin/kyc/list", axum::routing::get(routes::admin_kyc_list))
+        .route("/api/admin/kyc/:id/review", axum::routing::post(routes::admin_kyc_review))
         // OpenAPI Documentation Routes
         .route("/docs/openapi.json", axum::routing::get(openapi_json))
         .route("/docs/swagger.json", axum::routing::get(openapi_json))

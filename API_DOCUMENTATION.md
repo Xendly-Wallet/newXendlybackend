@@ -59,6 +59,11 @@ http://localhost:8080/api
 }
 ```
 
+**Notes:**
+- If a phone number is provided, a welcome SMS will be sent automatically
+- The welcome SMS includes account details and next steps
+- SMS delivery failures won't prevent account creation
+
 ### POST /api/auth/login
 
 **Description:** Authenticate user and get JWT token
@@ -327,6 +332,56 @@ http://localhost:8080/api
 }
 ```
 
+### POST /api/profile/phone/send-verification
+
+**Description:** Send SMS verification code to phone number
+
+**Request Body:**
+```json
+{
+  "phone_number": "+1234567890"
+}
+```
+
+**Response:**
+```json
+{
+  "message": "Verification code sent successfully",
+  "success": true
+}
+```
+
+### POST /api/profile/phone/verify
+
+**Description:** Verify phone number with SMS code
+
+**Request Body:**
+```json
+{
+  "code": "123456"
+}
+```
+
+**Response:**
+```json
+{
+  "message": "Phone number verified successfully",
+  "success": true
+}
+```
+
+**Verification SMS Example:**
+```
+🔐 Xendly Phone Verification
+
+Your verification code is: 123456
+
+This code is valid for 10 minutes.
+If you didn't request this code, please ignore this message.
+
+Xendly Team
+```
+
 ## Notifications
 
 ### GET /api/notifications
@@ -400,6 +455,25 @@ curl -X POST http://localhost:8080/api/auth/register \
   }'
 ```
 
+**Welcome SMS Example:**
+```
+🎉 Welcome to Xendly!
+
+Your account has been created successfully.
+Username: testuser
+Email: user@example.com
+
+Next steps:
+• Log in to your account
+• Create your first wallet
+• Start sending and receiving payments
+
+Need help? Contact us at support@xendly.com
+Visit: https://xendly.com
+
+Thank you for choosing Xendly! 🚀
+```
+
 ### Login
 
 ```bash
@@ -435,6 +509,26 @@ curl -X POST http://localhost:8080/api/wallets/<wallet-id>/send \
     "memo": "Payment for services",
     "password": "wallet-password",
     "totp_code": "123456"
+  }'
+```
+
+### Verify phone number
+
+```bash
+# Step 1: Send verification code
+curl -X POST http://localhost:8080/api/profile/phone/send-verification \
+  -H "Authorization: Bearer <your-jwt-token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "phone_number": "+1234567890"
+  }'
+
+# Step 2: Verify the code received via SMS
+curl -X POST http://localhost:8080/api/profile/phone/verify \
+  -H "Authorization: Bearer <your-jwt-token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "code": "123456"
   }'
 ```
 
