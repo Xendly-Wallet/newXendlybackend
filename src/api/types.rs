@@ -349,3 +349,15 @@ pub struct KycReviewResponse {
     pub success: bool,
     pub message: String,
 } 
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct Verify2FAPasswordRequest {
+    pub password: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct Verify2FAPasswordResponse {
+    pub success: bool,
+    pub message: Option<String>,
+    pub setup_token: Option<String>,
+} 

@@ -23,6 +23,7 @@ use std::fs;
 use std::io::Write;
 use crate::services::notification_service::NotificationService;
 use crate::models::stellar_wallet::AssetBalance;
+use utoipa::ToSchema;
 
 // JWT extractor for Authorization: Bearer ...
 pub struct AuthBearer(pub String);
@@ -74,7 +75,8 @@ pub fn api_router() -> Router {
 /// Auth API endpoints
 pub fn auth_router() -> Router {
     Router::new()
-        // .route("/register", post(register)) // Removed to avoid duplicate registration
+        .route("/login", post(login))
+        .route("/register", post(register))
         .route("/2fa-verify", post(two_fa_verify))
         .route("/change-password", post(change_password))
         .route("/disable-2fa", post(disable_2fa))
@@ -1673,19 +1675,33 @@ pub async fn get_2fa_status(
 pub async fn setup_2fa(
     AuthBearer(token): AuthBearer,
 ) -> (StatusCode, Json<TwoFASetupResponse>) {
-    let db = GLOBAL_DB.get().unwrap().clone(); // TODO: Replace with global singleton
-    let user = match user_from_token(&token, db.clone()).await {
-        Ok(u) => u,
-        Err((_status, _msg)) => {
+    let db = GLOBAL_DB.get().unwrap().clone();
+    // Validate the 2fa_setup_token
+    let jwt_secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set in environment for production!");
+    let jwt_manager = JwtManager::new(jwt_secret);
+    let token_data = match jwt_manager.validate_2fa_setup_token(&token) {
+        Ok(data) => data,
+        Err(e) => {
             return (StatusCode::UNAUTHORIZED, Json(TwoFASetupResponse {
                 qr_code_svg: "".to_string(),
                 secret_key: "".to_string(),
                 backup_codes: vec![],
-                message: "Unauthorized".to_string(),
+                message: format!("Unauthorized: {}", e),
             }));
         }
     };
-    let user_record = match db.get_user_by_id(&user.user_id).await {
+    let user_id = match uuid::Uuid::parse_str(&token_data.claims.sub) {
+        Ok(uid) => uid,
+        Err(_) => {
+            return (StatusCode::UNAUTHORIZED, Json(TwoFASetupResponse {
+                qr_code_svg: "".to_string(),
+                secret_key: "".to_string(),
+                backup_codes: vec![],
+                message: "Invalid user ID in token".to_string(),
+            }));
+        }
+    };
+    let user_record = match db.get_user_by_id(&user_id).await {
         Ok(u) => u,
         Err(_) => {
             return (StatusCode::UNAUTHORIZED, Json(TwoFASetupResponse {
@@ -1696,7 +1712,6 @@ pub async fn setup_2fa(
             }));
         }
     };
-    
     if user_record.totp_enabled {
         return (StatusCode::BAD_REQUEST, Json(TwoFASetupResponse {
             qr_code_svg: "".to_string(),
@@ -1705,9 +1720,8 @@ pub async fn setup_2fa(
             message: "2FA is already enabled".to_string(),
         }));
     }
-    
     let two_factor_service = crate::services::two_factor_service::TwoFactorService::new(db.clone());
-    match two_factor_service.generate_setup_data(&user.user_id).await {
+    match two_factor_service.generate_setup_data(&user_id).await {
         Ok((qr_code_svg, secret_key, backup_codes)) => {
             (StatusCode::OK, Json(TwoFASetupResponse {
                 qr_code_svg,
@@ -1727,6 +1741,14 @@ pub async fn setup_2fa(
     }
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct Enable2FAResponse {
+    pub success: bool,
+    pub message: String,
+    pub backup_codes: Vec<String>,
+    pub enabled: bool,
+}
+
 #[utoipa::path(post, path = "/api/profile/2fa/enable", request_body = Enable2FARequest, responses((status = 200, body = Enable2FAResponse), (status = 401, description = "Unauthorized or invalid TOTP"), (status = 400, description = "2FA already enabled")))]
 pub async fn enable_2fa(
     AuthBearer(token): AuthBearer,
@@ -1740,10 +1762,10 @@ pub async fn enable_2fa(
                 success: false,
                 message: "You must be logged in to enable 2FA.".to_string(),
                 backup_codes: vec![],
+                enabled: false,
             }));
         }
     };
-    
     let two_factor_service = crate::services::two_factor_service::TwoFactorService::new(db.clone());
     match two_factor_service.enable_2fa(&user.user_id, &req.totp_code).await {
         Ok(backup_codes) => {
@@ -1751,6 +1773,7 @@ pub async fn enable_2fa(
                 success: true,
                 message: "2FA enabled successfully. Save your backup codes in a secure location.".to_string(),
                 backup_codes,
+                enabled: true,
             }))
         }
         Err(e) => {
@@ -1759,6 +1782,7 @@ pub async fn enable_2fa(
                 success: false,
                 message: "Failed to enable 2FA. Please check your code and try again.".to_string(),
                 backup_codes: vec![],
+                enabled: false,
             }))
         }
     }
@@ -1981,6 +2005,59 @@ pub async fn admin_kyc_review(
     }
 }
 
+#[utoipa::path(post, path = "/api/profile/2fa/verify-password", request_body = Verify2FAPasswordRequest, responses((status = 200, body = Verify2FAPasswordResponse), (status = 401, description = "Unauthorized or invalid password")))]
+pub async fn verify_2fa_password(
+    AuthBearer(token): AuthBearer,
+    Json(req): Json<crate::api::types::Verify2FAPasswordRequest>,
+) -> (StatusCode, Json<crate::api::types::Verify2FAPasswordResponse>) {
+    let db = GLOBAL_DB.get().unwrap().clone();
+    let user = match user_from_token(&token, db.clone()).await {
+        Ok(u) => u,
+        Err((_status, msg)) => {
+            return (StatusCode::UNAUTHORIZED, Json(crate::api::types::Verify2FAPasswordResponse {
+                success: false,
+                message: Some(msg),
+                setup_token: None,
+            }));
+        }
+    };
+    let user_record = match db.get_user_by_id(&user.user_id).await {
+        Ok(u) => u,
+        Err(_) => {
+            return (StatusCode::UNAUTHORIZED, Json(crate::api::types::Verify2FAPasswordResponse {
+                success: false,
+                message: Some("User not found".to_string()),
+                setup_token: None,
+            }));
+        }
+    };
+    let valid = PasswordManager::verify_password(&req.password, &user_record.password_hash).unwrap_or(false);
+    if !valid {
+        return (StatusCode::UNAUTHORIZED, Json(crate::api::types::Verify2FAPasswordResponse {
+            success: false,
+            message: Some("Invalid password".to_string()),
+            setup_token: None,
+        }));
+    }
+    let jwt_secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set in environment for production!");
+    let jwt_manager = JwtManager::new(jwt_secret);
+    let setup_token = match jwt_manager.generate_2fa_setup_token(&user_record.id, &user_record.username, &user_record.email) {
+        Ok(token) => token,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(crate::api::types::Verify2FAPasswordResponse {
+                success: false,
+                message: Some(format!("Failed to generate setup token: {}", e)),
+                setup_token: None,
+            }));
+        }
+    };
+    (StatusCode::OK, Json(crate::api::types::Verify2FAPasswordResponse {
+        success: true,
+        message: Some("Password verified. Use setup_token for 2FA setup.".to_string()),
+        setup_token: Some(setup_token),
+    }))
+}
+
 /// Profile API endpoints
 pub fn profile_router() -> Router {
     Router::new()
@@ -1991,10 +2068,12 @@ pub fn profile_router() -> Router {
         .route("/phone/verify", post(verify_phone_code))
         .route("/2fa/status", get(get_2fa_status))
         .route("/2fa/setup", get(setup_2fa))
+        .route("/2fa/setup", post(setup_2fa))
         .route("/2fa/enable", post(enable_2fa))
         .route("/kyc/submit", post(kyc_submit))
         .route("/kyc/status", get(kyc_status))
         .route("/kyc/upload-id", post(kyc_upload_id))
+        .route("/2fa/verify-password", post(verify_2fa_password))
 } 
 
 // Update wallet_router to include all endpoints

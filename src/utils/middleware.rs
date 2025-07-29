@@ -78,6 +78,10 @@ impl RateLimiter {
 static RATE_LIMITER: Lazy<DashMap<String, (u32, Instant)>> = Lazy::new(DashMap::new);
 
 pub async fn global_rate_limiter(request: Request, next: Next) -> Result<Response, StatusCode> {
+    // Allow all OPTIONS requests (CORS preflight) without rate limiting
+    if request.method() == axum::http::Method::OPTIONS {
+        return Ok(next.run(request).await);
+    }
     // Extract IP from request extensions
     let ip = request
         .extensions()

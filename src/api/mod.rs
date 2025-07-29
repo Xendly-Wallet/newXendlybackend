@@ -14,6 +14,8 @@ use uuid::Uuid;
 use axum::{http::HeaderValue};
 use tower_http::cors::{CorsLayer, Any};
 use hyper::Method;
+use axum::{routing::options, http::StatusCode};
+use axum::routing::post;
 
 mod routes;
 mod types;
@@ -170,37 +172,18 @@ pub async fn start_http_server() {
     let shared_state = (limiter.clone(), db.clone());
 
     let cors = CorsLayer::new()
-        .allow_origin("http://localhost:3000".parse::<HeaderValue>().unwrap())
+        .allow_origin(Any)
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers(Any);
 
     let app = Router::new()
-        .layer(cors)
-        .layer(axum::middleware::from_fn(request_id_middleware))
-        // Sensitive endpoints with per-IP rate limiting
-        .route(
-            "/api/auth/login",
-            axum::routing::post(routes::login)
-                .route_layer(axum::middleware::from_fn(global_rate_limiter))
-        )
-        .route(
-            "/api/auth/register",
-            axum::routing::post(routes::register)
-                .route_layer(axum::middleware::from_fn(global_rate_limiter))
-        )
-        .route(
-            "/api/wallets/:id/send",
-            axum::routing::post(routes::send_payment)
-                .route_layer(axum::middleware::from_fn(global_rate_limiter))
-        )
-        // All other routers (no rate limiting)
+        .route("/api/auth/login", options(|| async { StatusCode::NO_CONTENT }))
+        .route("/api/auth/register", options(|| async { StatusCode::NO_CONTENT }))
+        .route("/*path", options(|| async { StatusCode::NO_CONTENT })) // fallback for other paths
         .nest("/api/auth", routes::auth_router())
         .nest("/api/wallets", routes::wallet_router())
         .nest("/api/profile", routes::profile_router())
-        .nest(
-            "/api/notifications",
-            routes::notifications_router()
-        )
+        .nest("/api/notifications", routes::notifications_router())
         .route("/api/assets", axum::routing::get(routes::list_supported_assets))
         .route("/health", axum::routing::get(health_check))
         .route("/api/admin/kyc/list", axum::routing::get(routes::admin_kyc_list))
@@ -216,7 +199,9 @@ pub async fn start_http_server() {
         .merge(SwaggerUi::new("/api/docs").url("/api/openapi.json", openapi.clone()))
         // Redoc UI
         .merge(Redoc::with_url("/api/redoc", openapi))
-        .layer(Extension(shared_state));
+        .layer(Extension(shared_state))
+        .layer(cors)
+        .layer(axum::middleware::from_fn(request_id_middleware));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
     println!("🚀 HTTP API running at http://{}/health", addr);
@@ -225,6 +210,7 @@ pub async fn start_http_server() {
         tokio::net::TcpListener::bind(addr).await.unwrap(),
         app,
     )
+    
     .await
     .unwrap();
 }

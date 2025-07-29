@@ -78,6 +78,7 @@ impl TwoFactorService {
         let mut user = self.database.get_user_by_id(user_id).await?;
         user.totp_enabled = true;
         self.database.update_user_profile(&user).await?;
+        tracing::info!(user_id = %user_id, action = "2fa_enabled", "2FA enabled and persisted for user");
         let user = self.database.get_user_by_id(user_id).await?;
         if let Some(backup_codes_json) = user.backup_codes {
             let backup_codes: Vec<String> = serde_json::from_str(&backup_codes_json)?;
