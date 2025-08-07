@@ -69,7 +69,7 @@ pub fn generate_markdown_docs() -> String {
     markdown.push_str("**Request Body:**\n```json\n{\n  \"wallet_name\": \"My Stellar Wallet\",\n  \"password\": \"wallet-password\"\n}\n```\n\n");
     markdown.push_str("**Response:**\n```json\n{\n  \"wallet_id\": \"uuid\",\n  \"public_key\": \"G...\",\n  \"wallet_name\": \"My Stellar Wallet\",\n  \"message\": \"Wallet created successfully\"\n}\n```\n\n");
     
-    markdown.push_str("### POST /api/wallets/import\n\n");
+    markdown.push_str("### POST /import\n\n");
     markdown.push_str("**Description:** Import existing Stellar wallet\n\n");
     markdown.push_str("**Request Body:**\n```json\n{\n  \"wallet_name\": \"Imported Wallet\",\n  \"secret_key\": \"S...\",\n  \"password\": \"wallet-password\"\n}\n```\n\n");
     
