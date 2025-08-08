@@ -203,7 +203,10 @@ pub async fn start_http_server() {
         .layer(cors)
         .layer(axum::middleware::from_fn(request_id_middleware));
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
+    // ✅ Render binding to 0.0.0.0 and using PORT from env
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
+
     println!("🚀 HTTP API running at http://{}/health", addr);
     println!("📚 API Documentation available at: http://{}/api/docs", addr);
     axum::serve(
