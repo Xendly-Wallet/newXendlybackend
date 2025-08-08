@@ -2088,6 +2088,7 @@ pub fn wallet_router() -> Router {
         .route("/:id/sync", post(sync_wallet))
         .route("/:id/fund", post(fund_wallet))
         .route("/:id/receive", get(receive_wallet))
+        .route("/:id/send", post(send_payment))
 } 
 
 #[utoipa::path(
